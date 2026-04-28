@@ -20,7 +20,7 @@ jobs:
 
       - name: Instalando as bibliotecas
         run: |
-          pip install pandas numpy xgboost gspread oauth2client gspread-formatting
+          pip install pandas numpy xgboost gspread oauth2client gspread-formatting scikit-learn
 
       - name: Recriando o JSON secreto
         run: |
