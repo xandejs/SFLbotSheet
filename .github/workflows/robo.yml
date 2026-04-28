@@ -1,0 +1,32 @@
+name: SFL Auto-Trader Bot
+
+on:
+  schedule:
+    # Roda no minuto 0, a cada 2 horas (ex: 00:00, 02:00, 04:00...)
+    - cron: '0 */2 * * *'
+  # Permite que você clique num botão para rodar manualmente se quiser testar
+  workflow_dispatch: 
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixando o código do repositório
+        uses: actions/checkout@v3
+
+      - name: Instalando o Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Instalando as bibliotecas (Bibliotecas do Colab)
+        run: |
+          pip install pandas numpy xgboost gspread oauth2client gspread-formatting
+
+      - name: Recriando o JSON secreto no servidor
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credenciais_robo.json
+
+      - name: Rodando o Cérebro RL 🧠
+        run: python bot.py
