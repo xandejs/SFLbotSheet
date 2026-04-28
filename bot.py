@@ -189,7 +189,7 @@ gerenciar_memoria(gc, NOME_PLANILHA, q_table, modo="salvar")
 # Painel Final
 lista_final = []
 agora = datetime.now().strftime("%d/%m %H:%M")
-for item in df_ranking.head(12)['Item']:
+for item in df_ranking.head(15)['Item']:
     d_it = preparar_indicadores(df_bruto, item)
     row = d_it.iloc[-1]
     
