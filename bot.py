@@ -57,14 +57,15 @@ class SFL_Environment:
     
     def _get_state(self):
         row = self.df.iloc[self.current_step]
-        # Bins de RSI (0 a 4)
-        rsi_val = row['RSI'] if not np.isnan(row['RSI']) else 50
-        rsi_bin = int(min(4, max(0, rsi_val // 25)))
+        # Bins de RSI padronizados (0, 1, 2, 3) -> Dividir por 25
+        rsi_bin = int(min(3, max(0, row['RSI'] // 25)))
         volat_bin = 1 if row['Volatilidade'] > self.df['Volatilidade'].mean() else 0
-        limiar_lucro = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
-        ia_sinal = 1 if row['Preco_Futuro'] > row['Price'] * limiar_lucro else 0
-        estacao = int(row['Season_Num']) 
-        return (rsi_bin, volat_bin, ia_sinal, estacao)
+        
+        # Sinal IA Dinâmico (Taxa + 8% de lucro desejado)
+        limiar_ia = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
+        ia_sinal = 1 if row['Preco_Futuro'] > row['Price'] * limiar_ia else 0
+        
+        return (rsi_bin, volat_bin, ia_sinal, int(row['Season_Num']))
 
     def step(self, action):
         preco_hoje = self.df.iloc[self.current_step]['Price']
@@ -161,7 +162,12 @@ for item in df_bruto['Item'].unique():
     
     X = d_treino[['Price', 'Lag_1', 'RSI', 'Season_Num']]
     y = d_treino['Preco_Futuro']
-    model = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1).fit(X, y)
+    model = xgb.XGBRegressor(
+    n_estimators=50, 
+    max_depth=3, 
+    learning_rate=0.1,
+    base_score=0.5 # Ajuda na convergência inicial
+).fit(X, y)
     
     X_hoje = d_it[['Price', 'Lag_1', 'RSI', 'Season_Num']].tail(1)
     preco_previsto = model.predict(X_hoje)[0]
@@ -196,7 +202,17 @@ for item in df_ranking.head(15)['Item']:
     row = d_it.iloc[-1]
     
     roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
-    estado = (int(min(4, row['RSI'] // 20)), 1 if row['Volatilidade'] > d_it['Volatilidade'].mean() else 0, 1 if roi_pred > 15 else 0, int(row['Season_Num']))
+    
+    # IMPORTANTE: O estado aqui deve ser IDÊNTICO ao do treino
+    limiar_ia = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
+    ia_sinal_hoje = 1 if roi_pred > (limiar_ia - 1) * 100 else 0
+    
+    estado = (
+        int(min(3, row['RSI'] // 25)), 
+        1 if row['Volatilidade'] > d_it['Volatilidade'].mean() else 0, 
+        ia_sinal_hoje, 
+        int(row['Season_Num'])
+    )
     
     dec = np.argmax(q_table.get(estado, [0, 0, 0]))
     acao = ["ESPERAR", "COMPRAR", "VENDER"][dec]
