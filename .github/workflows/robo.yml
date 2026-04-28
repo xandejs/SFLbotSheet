@@ -1,3 +1,9 @@
+steps:
+  - name: Baixando o código
+    uses: actions/checkout@v4  
+
+  - name: Instalando o Python
+    uses: actions/setup-python@v5
 name: SFL Auto-Trader Bot
 
 on:
