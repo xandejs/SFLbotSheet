@@ -10,8 +10,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 # Configurações do Mercado
 NOME_PLANILHA = "SFL 2025_10"
 REGISTROS_POR_DIA = 12 
-TAXA_MARKETPLACE = 0.1 
-DIAS_SWING = 7           
+TAXA_MARKETPLACE = 0.1
+LUCRO_REAL_DESEJADO = 0.08
+DIAS_SWING = 12           
 SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA 
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
@@ -58,9 +59,10 @@ class SFL_Environment:
         row = self.df.iloc[self.current_step]
         # Bins de RSI (0 a 4)
         rsi_val = row['RSI'] if not np.isnan(row['RSI']) else 50
-        rsi_bin = int(min(4, max(0, rsi_val // 20)))
+        rsi_bin = int(min(4, max(0, rsi_val // 25)))
         volat_bin = 1 if row['Volatilidade'] > self.df['Volatilidade'].mean() else 0
-        ia_sinal = 1 if row['Preco_Futuro'] > row['Price'] * (1 + TAXA_MARKETPLACE) else 0
+        limiar_lucro = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
+        ia_sinal = 1 if row['Preco_Futuro'] > row['Price'] * limiar_lucro else 0
         estacao = int(row['Season_Num']) 
         return (rsi_bin, volat_bin, ia_sinal, estacao)
 
@@ -201,7 +203,7 @@ for item in df_ranking.head(15)['Item']:
     
     # 🛡️ BLOQUEIO ABSOLUTO (CONSERVADOR)
     if acao == "COMPRAR":
-        limite_caro = row['Media_120'] + (1.5 * row['Desvio_120'])
+        limite_caro = row['Media_120'] + (2.0 * row['Desvio_120'])
         if row['Price'] > limite_caro:
             acao = "ESPERAR (Caro/120d)"
 
