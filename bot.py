@@ -32,34 +32,30 @@ def preparar_indicadores(df_original, nome_item):
     d['Lag_1'] = d['Price'].shift(1)
     d['Volatilidade'] = d['Price'].rolling(window=REGISTROS_POR_DIA).std()
     
-    # 🛡️ Visão 120 dias (Suavizada para 2.0 Z-Score)
+    # 🛡️ Visão 120 dias
     JANELA_120 = 120 * REGISTROS_POR_DIA
     d['Media_120'] = d['Price'].rolling(window=JANELA_120, min_periods=1).mean()
     d['Desvio_120'] = d['Price'].rolling(window=JANELA_120, min_periods=1).std()
     
     d['Season_Num'] = d['Season'].map(MAP_ESTACOES).fillna(0)
     
-    # RSI Padronizado (Bins de 25)
+    # RSI Padronizado com Proteção contra NaN (.fillna(50))
     delta = d['Price'].diff()
     ganho = delta.clip(lower=0).rolling(window=SHIFT_ALVO).mean()
     perda = -1 * delta.clip(upper=0).rolling(window=SHIFT_ALVO).mean()
-    d['RSI'] = 100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))
+    d['RSI'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
     
     d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
     return d
 
 def analisar_origem_estoque(gc, nome_pl):
     sh = gc.open(nome_pl)
-    # Puxa os dados das abas
     df_log = pd.DataFrame(sh.worksheet("TradeLog").get_all_values()[1:], 
                           columns=["Tipo", "Item", "Qtd", "SFL", "Parceiro", "Data"])
     df_inv = pd.DataFrame(sh.worksheet("Inventario").get_all_values()[1:], 
                           columns=["Item", "Quantidade"])
 
-    # 1. Limpa os números (troca vírgula por ponto)
     df_log['Qtd'] = pd.to_numeric(df_log['Qtd'].str.replace(',', '.'), errors='coerce').fillna(0)
-    
-    # 2. Soma apenas o que foi COMPRA (Tipo contém "Compra")
     compras_totais = df_log[df_log['Tipo'].str.contains("Compra", case=False)].groupby('Item')['Qtd'].sum()
 
     origem_map = {}
@@ -67,21 +63,18 @@ def analisar_origem_estoque(gc, nome_pl):
         item = row['Item']
         saldo_atual = float(str(row['Quantidade']).replace(',', '.'))
         if saldo_atual <= 0: continue
-        
         qtd_comprada = compras_totais.get(item, 0)
 
-        # SEGREDO DA DIFERENCIAÇÃO:
         if qtd_comprada >= saldo_atual:
-            origem_map[item] = 2  # REVENDA (Comprou mais do que tem, então o que tem é estoque de flip)
+            origem_map[item] = 2  # REVENDA
         else:
-            origem_map[item] = 1  # COLHEITA (Tem mais saldo do que comprou, ou nunca comprou)
-            
+            origem_map[item] = 1  # COLHEITA
     return origem_map
 
 class SFL_Environment:
     def __init__(self, df_processado, origem_item=0):
         self.df = df_processado.dropna(subset=['RSI', 'Volatilidade']).reset_index(drop=True)
-        self.origem = origem_item # 0: Nada, 1: Colheita, 2: Revenda
+        self.origem = origem_item 
         self.reset()
         
     def reset(self):
@@ -92,45 +85,27 @@ class SFL_Environment:
         row = self.df.iloc[self.current_step]
         rsi_bin = int(min(3, max(0, row['RSI'] // 25)))
         volat_bin = 1 if row['Volatilidade'] > self.df['Volatilidade'].mean() else 0
-        
-        # Sinal IA Dinâmico: Taxa + Lucro Real
         limiar_ia = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
         ia_sinal = 1 if row['Preco_Futuro'] > row['Price'] * limiar_ia else 0
-        
         return (rsi_bin, volat_bin, ia_sinal, int(row['Season_Num']), self.origem)
 
     def step(self, action):
         preco_hoje = self.df.iloc[self.current_step]['Price']
         if self.current_step + SHIFT_ALVO >= len(self.df):
             return self._get_state(), 0, True
-
         self.current_step += 1
         preco_novo = self.df.iloc[self.current_step]['Price']
         variacao_pct = ((preco_novo - preco_hoje) / preco_hoje) * 100 if preco_hoje > 0 else 0
-            
-        if action == 1:   # COMPRAR
-            reward = variacao_pct - (TAXA_MARKETPLACE * 100)
-        elif action == 2: # VENDER
-            if self.origem == 2: # Revenda: Punição por segurar capital
-                reward = (variacao_pct - (TAXA_MARKETPLACE * 100))
-            else: # Colheita: Foca no lucro bruto
-                reward = variacao_pct
-        else: # ESPERAR
-            # Penaliza levemente o capital parado se for revenda
-            reward = -0.05 if self.origem == 2 else 0
-            
+        if action == 1: reward = variacao_pct - (TAXA_MARKETPLACE * 100)
+        elif action == 2: reward = (variacao_pct - (TAXA_MARKETPLACE * 100)) if self.origem == 2 else variacao_pct
+        else: reward = -0.05 if self.origem == 2 else 0
         done = (self.current_step >= len(self.df) - SHIFT_ALVO - 1)
         return self._get_state(), reward, done
-
-# ==============================================================================
-# GESTÃO DE MEMÓRIA E DASHBOARD
-# ==============================================================================
 
 def gerenciar_memoria(gc, nome_pl, q_tab=None, modo="carregar"):
     sh = gc.open(nome_pl)
     try: ws = sh.worksheet("Cerebro_RL")
     except: ws = sh.add_worksheet(title="Cerebro_RL", rows="2000", cols="8")
-    
     if modo == "carregar":
         dados = ws.get_all_values()
         nova_tab = {}
@@ -156,7 +131,6 @@ def salvar_sinais_hoje(gc, nome_pl, lista_sinais):
     cabecalho = [["Item", "ROI Previsto %", "Decisão Final", "Origem", "Estação", "Atualização"]]
     ws.clear()
     ws.update(values=(cabecalho + lista_sinais), range_name='A1')
-    # [Formatos de cores permanecem os mesmos]
 
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL
@@ -175,26 +149,40 @@ df_bruto = df_bruto.dropna(subset=['Price'])
 
 mapa_origem = analisar_origem_estoque(gc, NOME_PLANILHA)
 
-# XGBoost - Previsão de ROI
+# Melhoria 1: Cache para não re-processar indicadores
+cache_indicadores = {}
 ranking = []
+
+print("📡 Analisando Sazonalidade e ROI (XGBoost)...")
 for item in df_bruto['Item'].unique():
-    d_it = preparar_indicadores(df_bruto, item)
-    d_treino = d_it.dropna(subset=['Preco_Futuro', 'RSI', 'Lag_1'])
-    if len(d_treino) < 30: continue
-    
-    X, y = d_treino[['Price', 'Lag_1', 'RSI', 'Season_Num']], d_treino['Preco_Futuro']
-    model = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1, base_score=0.5).fit(X, y)
-    
-    X_hoje = d_it[['Price', 'Lag_1', 'RSI', 'Season_Num']].tail(1)
-    roi = ((model.predict(X_hoje)[0] - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
-    ranking.append({'Item': item, 'ROI': roi})
+    try:
+        d_it = preparar_indicadores(df_bruto, item)
+        cache_indicadores[item] = d_it # Salvando no cache
+        
+        d_treino = d_it.dropna(subset=['Preco_Futuro', 'RSI', 'Lag_1'])
+        if len(d_treino) < 30: continue
+        
+        X, y = d_treino[['Price', 'Lag_1', 'RSI', 'Season_Num']], d_treino['Preco_Futuro']
+        
+        # Melhoria 3: XGBoost Robusto com try/except
+        model = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1, base_score=0.5).fit(X, y)
+        
+        X_hoje = d_it[['Price', 'Lag_1', 'RSI', 'Season_Num']].tail(1)
+        roi = ((model.predict(X_hoje)[0] - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
+        ranking.append({'Item': item, 'ROI': roi})
+    except Exception as e:
+        print(f"⚠️ Pulando {item} por erro nos dados: {e}")
+        continue
 
 df_ranking = pd.DataFrame(ranking).sort_values(by='ROI', ascending=False)
 q_table = gerenciar_memoria(gc, NOME_PLANILHA, modo="carregar")
 
-# Treino RL com Contexto de Origem
+print("🤖 Treinando Tomada de Decisão (RL)...")
 for item in df_ranking.head(15)['Item']:
-    d_it = preparar_indicadores(df_bruto, item)
+    # Melhoria: Recuperando do cache
+    d_it = cache_indicadores.get(item)
+    if d_it is None or len(d_it) < 60: continue
+    
     origem = mapa_origem.get(item, 0)
     env = SFL_Environment(d_it, origem)
     for ep in range(30):
@@ -211,7 +199,7 @@ gerenciar_memoria(gc, NOME_PLANILHA, q_table, modo="salvar")
 # Painel Final
 lista_final, agora = [], datetime.now().strftime("%d/%m %H:%M")
 for item in df_ranking.head(15)['Item']:
-    d_it = preparar_indicadores(df_bruto, item)
+    d_it = cache_indicadores.get(item) # Recuperando do cache
     row = d_it.iloc[-1]
     roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
     origem = mapa_origem.get(item, 0)
@@ -220,7 +208,6 @@ for item in df_ranking.head(15)['Item']:
     ia_sinal_hoje = 1 if roi_pred > (limiar_ia - 1) * 100 else 0
     
     estado = (int(min(3, row['RSI'] // 25)), 1 if row['Volatilidade'] > d_it['Volatilidade'].mean() else 0, ia_sinal_hoje, int(row['Season_Num']), origem)
-    
     acao = ["ESPERAR", "COMPRAR", "VENDER"][np.argmax(q_table.get(estado, [0, 0, 0]))]
     
     if acao == "COMPRAR" and row['Price'] > (row['Media_120'] + (2.0 * row['Desvio_120'])):
