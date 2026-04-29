@@ -81,7 +81,16 @@ def analisar_origem_estoque(gc, nome_pl):
         if saldo_atual <= 0: continue
         
         qtd_comprada = compras_totais.get(item, 0)
-        origem_map[item] = 2 if qtd_comprada >= saldo_atual else 1
+        
+        # Cálculo de Contaminação Dinâmica
+        sujeira = max(0, saldo_atual - qtd_comprada)
+        porcentagem_sujeira = sujeira / saldo_atual
+        
+        if qtd_comprada > 0 and porcentagem_sujeira <= 0.15:
+            origem_map[item] = 2  # REVENDA
+        else:
+            origem_map[item] = 1  # COLHEITA
+    
             
     return origem_map
 
