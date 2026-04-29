@@ -191,7 +191,7 @@ df_ranking = pd.DataFrame(ranking).sort_values(by='ROI', ascending=False)
 q_table = gerenciar_memoria(gc, NOME_PLANILHA, modo="carregar")
 
 print("🤖 Treinando RL...")
-for item in df_ranking.head(20)['Item']:
+for item in df_ranking.head(30)['Item']:
     d_it = cache_indicadores.get(item)
     if d_it is None or len(d_it) < 60: continue
     env = SFL_Environment(d_it, mapa_origem.get(item, 0))
@@ -207,7 +207,7 @@ for item in df_ranking.head(20)['Item']:
 gerenciar_memoria(gc, NOME_PLANILHA, q_table, modo="salvar")
 
 lista_final, agora = [], datetime.now().strftime("%d/%m %H:%M")
-for item in df_ranking.head(20)['Item']:
+for item in df_ranking.head(30)['Item']:
     d_it = cache_indicadores.get(item)
     row = d_it.iloc[-1]
     roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
