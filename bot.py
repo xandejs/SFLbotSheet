@@ -49,37 +49,34 @@ def preparar_indicadores(df_original, nome_item):
     return d
 
 def analisar_origem_estoque(gc, nome_pl):
-    """Cruza TradeLog com Inventário para saber o que é colheita e o que é revenda"""
     sh = gc.open(nome_pl)
-    try:
-        log_data = sh.worksheet("TradeLog").get_all_values()
-        inv_data = sh.worksheet("Inventario").get_all_values()
+    # Puxa os dados das abas
+    df_log = pd.DataFrame(sh.worksheet("TradeLog").get_all_values()[1:], 
+                          columns=["Tipo", "Item", "Qtd", "SFL", "Parceiro", "Data"])
+    df_inv = pd.DataFrame(sh.worksheet("Inventario").get_all_values()[1:], 
+                          columns=["Item", "Quantidade"])
+
+    # 1. Limpa os números (troca vírgula por ponto)
+    df_log['Qtd'] = pd.to_numeric(df_log['Qtd'].str.replace(',', '.'), errors='coerce').fillna(0)
+    
+    # 2. Soma apenas o que foi COMPRA (Tipo contém "Compra")
+    compras_totais = df_log[df_log['Tipo'].str.contains("Compra", case=False)].groupby('Item')['Qtd'].sum()
+
+    origem_map = {}
+    for _, row in df_inv.iterrows():
+        item = row['Item']
+        saldo_atual = float(str(row['Quantidade']).replace(',', '.'))
+        if saldo_atual <= 0: continue
         
-        df_log = pd.DataFrame(log_data[1:], columns=log_data[0])
-        df_inv = pd.DataFrame(inv_data[1:], columns=inv_data[0])
-        
-        # Cálculo de Compras Totais por Item no Log
-        df_log['Qtd'] = pd.to_numeric(df_log['Quantidade'].str.replace(',', '.'), errors='coerce').fillna(0)
-        compras = df_log[df_log['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Qtd'].sum()
-        
-        origem_map = {}
-        for _, row in df_inv.iterrows():
-            item = row['Item']
-            saldo = float(str(row['Quantidade']).replace(',', '.'))
-            if saldo <= 0: continue
+        qtd_comprada = compras_totais.get(item, 0)
+
+        # SEGREDO DA DIFERENCIAÇÃO:
+        if qtd_comprada >= saldo_atual:
+            origem_map[item] = 2  # REVENDA (Comprou mais do que tem, então o que tem é estoque de flip)
+        else:
+            origem_map[item] = 1  # COLHEITA (Tem mais saldo do que comprou, ou nunca comprou)
             
-            qtd_comprada = compras.get(item, 0)
-            
-            # Lógica: Se tenho mais saldo que compras, a diferença é colheita
-            if qtd_comprada >= saldo:
-                origem_map[item] = 2 # Revenda Predominante (Precisa girar capital)
-            elif qtd_comprada > 0:
-                origem_map[item] = 1 # Misto/Colheita (Pode ser mais paciente)
-            else:
-                origem_map[item] = 1 # Colheita Pura
-        return origem_map
-    except:
-        return {}
+    return origem_map
 
 class SFL_Environment:
     def __init__(self, df_processado, origem_item=0):
