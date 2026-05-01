@@ -150,11 +150,12 @@ def gerenciar_memoria(gc, nome_pl, q_tab=None, modo="carregar"):
 def salvar_sinais_hoje(gc, nome_pl, lista_sinais):
     sh = gc.open(nome_pl)
     try: ws = sh.worksheet("Sinais_Hoje")
-    except: ws = sh.add_worksheet(title="Sinais_Hoje", rows="60", cols="6")
-    cabecalho = [["Item", "ROI Previsto %", "Decisão Final", "Origem", "Estação", "Atualização"]]
+    except: ws = sh.add_worksheet(title="Sinais_Hoje", rows="80", cols="8") # Aumentado para 8 cols
+    
+    # Cabeçalho atualizado
+    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Atualização"]]
     ws.clear()
     ws.update(values=(cabecalho + lista_sinais), range_name='A1')
-
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL
 # ==============================================================================
@@ -206,17 +207,42 @@ for item in df_ranking.head(30)['Item']:
 
 gerenciar_memoria(gc, NOME_PLANILHA, q_table, modo="salvar")
 
+# Painel Final com Alvos de Preço
 lista_final, agora = [], datetime.now().strftime("%d/%m %H:%M")
+
 for item in df_ranking.head(30)['Item']:
     d_it = cache_indicadores.get(item)
     row = d_it.iloc[-1]
     roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
     origem = mapa_origem.get(item, 0)
-    ia_sinal_hoje = 1 if roi_pred > (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO - 1) * 100 else 0
+    
+    # Cálculos de Preço
+    preco_atual = row['Price']
+    alvo_entrada = row['Media_120'] - (2.0 * row['Desvio_120'])
+    alvo_saida = preco_atual * (1 + (roi_pred / 100))
+    
+    # Lógica de Decisão (Mantida)
+    limiar_ia = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
+    ia_sinal_hoje = 1 if roi_pred > (limiar_ia - 1) * 100 else 0
     estado = (int(min(3, row['RSI'] // 25)), 1 if row['Volatilidade'] > d_it['Volatilidade'].mean() else 0, ia_sinal_hoje, int(row['Season_Num']), origem)
+    
     acao = ["ESPERAR", "COMPRAR", "VENDER"][np.argmax(q_table.get(estado, [0, 0, 0]))]
-    if acao == "COMPRAR" and row['Price'] > (row['Media_120'] + (2.0 * row['Desvio_120'])): acao = "ESPERAR (Caro/120d)"
-    lista_final.append([item, round(roi_pred, 1), acao, "Colheita" if origem == 1 else ("Revenda" if origem == 2 else "Mercado"), row['Season'], agora])
+    if acao == "COMPRAR" and preco_atual > (row['Media_120'] + (2.0 * row['Desvio_120'])):
+        acao = "ESPERAR (Caro/120d)"
+
+    origem_txt = "Colheita" if origem == 1 else ("Revenda" if origem == 2 else "Mercado")
+    
+    # Adicionando à lista com os novos preços formatados
+    lista_final.append([
+        item, 
+        round(roi_pred, 1), 
+        acao, 
+        round(alvo_entrada, 4), 
+        round(alvo_saida, 4), 
+        origem_txt, 
+        row['Season'], 
+        agora
+    ])
 
 salvar_sinais_hoje(gc, NOME_PLANILHA, lista_final)
 print("✅ Gestão finalizada!")
