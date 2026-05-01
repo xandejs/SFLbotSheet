@@ -207,7 +207,7 @@ for item in df_ranking.head(30)['Item']:
 
 gerenciar_memoria(gc, NOME_PLANILHA, q_table, modo="salvar")
 
-# Painel Final com Alvos de Preço
+# Painel Final com Travas de Sanidade
 lista_final, agora = [], datetime.now().strftime("%d/%m %H:%M")
 
 for item in df_ranking.head(30)['Item']:
@@ -216,29 +216,40 @@ for item in df_ranking.head(30)['Item']:
     roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
     origem = mapa_origem.get(item, 0)
     
-    # Cálculos de Preço
     preco_atual = row['Price']
-    alvo_entrada = row['Media_120'] - (2.0 * row['Desvio_120'])
-    alvo_saida = preco_atual * (1 + (roi_pred / 100))
+    max_historico = d_it['Price'].max() # Pega o topo real do RecLog
     
-    # Lógica de Decisão (Mantida)
+    # 1. Alvo de Entrada Sniper (Mantido)
+    alvo_entrada = row['Media_120'] - (2.0 * row['Desvio_120'])
+    
+    # 2. Trava de Saída: O alvo não pode ignorar o teto histórico
+    # Calculamos o alvo da IA, mas limitamos a 10% acima do máximo já visto
+    alvo_saida_ia = preco_atual * (1 + (roi_pred / 100))
+    alvo_saida_realista = min(alvo_saida_ia, max_historico * 1.1)
+    
+    # 3. Lógica de Decisão com Filtro de Topo
     limiar_ia = 1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO
     ia_sinal_hoje = 1 if roi_pred > (limiar_ia - 1) * 100 else 0
     estado = (int(min(3, row['RSI'] // 25)), 1 if row['Volatilidade'] > d_it['Volatilidade'].mean() else 0, ia_sinal_hoje, int(row['Season_Num']), origem)
     
     acao = ["ESPERAR", "COMPRAR", "VENDER"][np.argmax(q_table.get(estado, [0, 0, 0]))]
-    if acao == "COMPRAR" and preco_atual > (row['Media_120'] + (2.0 * row['Desvio_120'])):
-        acao = "ESPERAR (Caro/120d)"
+    
+    # Anti-Alucinação: Se está perto do topo histórico, mude para VENDER ou ESPERAR
+    if acao == "COMPRAR" and preco_atual > (row['Media_120'] + (1.0 * row['Desvio_120'])):
+        acao = "ESPERAR (Topo)"
+    
+    # Se o preço atual já bateu 95% do máximo histórico, ignore o otimismo e venda!
+    if preco_atual >= (max_historico * 0.95) and origem == 2:
+        acao = "VENDER (Alvo Real)"
 
     origem_txt = "Colheita" if origem == 1 else ("Revenda" if origem == 2 else "Mercado")
     
-    # Adicionando à lista com os novos preços formatados
     lista_final.append([
         item, 
         round(roi_pred, 1), 
         acao, 
         round(alvo_entrada, 4), 
-        round(alvo_saida, 4), 
+        round(alvo_saida_realista, 4), # Usando a saída limitada
         origem_txt, 
         row['Season'], 
         agora
