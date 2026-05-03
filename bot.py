@@ -62,18 +62,20 @@ def calcular_fifo_hibrido(sh, inventario_dict):
     """Calcula o Preço Médio baseado nas últimas compras que compõem o estoque atual"""
     try:
         log_data = sh.worksheet("TradeLog").get_all_values()
+        # Lê os cabeçalhos exatamente como estão na primeira linha da tua planilha
         df_log = pd.DataFrame(log_data[1:], columns=log_data[0])
-        df_log['Qtd'] = df_log['Quantidade'].apply(limpar_numero)
+        
+        # Usa 'Qtd' em vez de 'Quantidade'
+        df_log['Qtd'] = df_log['Qtd'].apply(limpar_numero)
         df_log['SFL_Total'] = df_log['SFL'].apply(limpar_numero).abs()
         
-        # Filtra apenas compras
         df_compras = df_log[df_log['Tipo'].str.contains("Compra", case=False)].copy()
         
         fifo_map = {}
         for item, saldo_real in inventario_dict.items():
             if saldo_real <= 0: continue
             
-            # Pega compras do item (mais recentes primeiro)
+            # Usa 'Nome do Item' em vez de 'Item'
             compras_item = df_compras[df_compras['Nome do Item'] == item].iloc[::-1]
             
             qtd_acumulada = 0
@@ -89,15 +91,15 @@ def calcular_fifo_hibrido(sh, inventario_dict):
                 custo_total += (usar * preco_unitario)
                 qtd_acumulada += usar
             
-            # Se o log não cobrir o estoque todo, o resto é custo 0 (colheita) ou média
             if qtd_acumulada > 0:
                 fifo_map[item] = custo_total / qtd_acumulada
             else:
                 fifo_map[item] = 0.0
         return fifo_map
-    except:
+    except Exception as e:
+        print(f"Erro no FIFO Híbrido: {e}")
         return {}
-
+        
 def analisar_origem_estoque(compras_totais, saldo_atual):
     if saldo_atual <= 0: return 0
     sujeira = max(0, saldo_atual - compras_totais)
@@ -208,7 +210,9 @@ mapa_custo_fifo = calcular_fifo_hibrido(sh, inv_dict)
 
 log_data = sh.worksheet("TradeLog").get_all_values()
 df_trade = pd.DataFrame(log_data[1:], columns=log_data[0])
-compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Quantidade'].apply(lambda x: sum(map(limpar_numero, x))).to_dict()
+
+# Aqui agrupamos por 'Nome do Item' e somamos a 'Qtd' (antes estava Quantidade)
+compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Qtd'].apply(lambda x: sum(map(limpar_numero, x))).to_dict()
 
 # 3. Processamento RecLog
 rec_data = sh.worksheet("RecLog").get_all_values()[1:]
