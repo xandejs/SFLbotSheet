@@ -112,24 +112,26 @@ def analisar_origem_estoque(compras_totais, saldo_atual):
 
 def preparar_indicadores(df_original, nome_item):
     d = df_original[df_original['Item'] == nome_item].copy()
-    d['Timestamp'] = pd.to_datetime(d['Timestamp'], format='%d/%m/%Y %H:%M', errors='coerce')
+    # Mudança: dayfirst=True resolve o problema de data com ou sem hora automaticamente
+    d['Timestamp'] = pd.to_datetime(d['Timestamp'], dayfirst=True, errors='coerce')
     d = d.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
     
     if len(d) < 10: return d
 
-    # Indicadores Técnicos
+    # Garante que a Season_Num exista para o RL não travar
+    d['Season_Num'] = d['Season'].map(MAP_ESTACOES).fillna(0)
+
+    # Indicadores Técnicos (Mantidos)
     d['Lag_1'] = d['Price'].shift(1)
     d['Volatilidade'] = d['Price'].rolling(window=REGISTROS_POR_DIA).std()
     d['Media_120'] = d['Price'].rolling(window=120 * REGISTROS_POR_DIA, min_periods=1).mean()
     d['Desvio_120'] = d['Price'].rolling(window=120 * REGISTROS_POR_DIA, min_periods=1).std()
     
-    # RSI com Proteção
     delta = d['Price'].diff()
     ganho = delta.clip(lower=0).rolling(window=SHIFT_ALVO).mean()
     perda = -1 * delta.clip(upper=0).rolling(window=SHIFT_ALVO).mean()
     d['RSI'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
     
-    # Pesos Temporais (Novos dados valem mais)
     max_date = d['Timestamp'].max()
     d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
     
@@ -214,10 +216,13 @@ df_trade = pd.DataFrame(log_data[1:], columns=log_data[0])
 # Aqui agrupamos por 'Nome do Item' e somamos a 'Qtd' (antes estava Quantidade)
 compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Qtd'].apply(lambda x: sum(map(limpar_numero, x))).to_dict()
 
-# 3. Processamento RecLog
-rec_data = sh.worksheet("RecLog").get_all_values()[1:]
-df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item', 'Price', 'Season'])
-df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
+# 3. Processamento RecLog (Parte do Ranking)
+
+if not ranking:
+    print("⚠️ AVISO: Nenhum item possui dados suficientes (mínimo 174 registros) para gerar ranking.")
+    df_ranking = pd.DataFrame(columns=['Item', 'ROI']) # Cria DF vazio mas com colunas para não quebrar o loop abaixo
+else:
+    df_ranking = pd.DataFrame(ranking).sort_values(by='ROI', ascending=False)
 
 cache_indicadores = {}
 ranking = []
