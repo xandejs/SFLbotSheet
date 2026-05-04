@@ -202,3 +202,40 @@ if alertas_msg: enviar_telegram("\n\n".join(alertas_msg))
 
 # Aqui você chamaria suas funções de salvar na planilha
 print("✅ Ciclo finalizado!")
+
+# ==============================================================================
+# 5. SALVAMENTO NA PLANILHA (Sinais_Hoje)
+# ==============================================================================
+
+print(f"pág. 📝 Escrevendo {len(lista_final)} sinais na Sinais_Hoje...")
+
+try:
+    # Tenta abrir a aba, se não existir, cria
+    try:
+        ws_sinais = sh.worksheet("Sinais_Hoje")
+    except:
+        ws_sinais = sh.add_worksheet(title="Sinais_Hoje", rows="100", cols="10")
+
+    # Prepara o cabeçalho
+    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Atualização"]]
+    
+    # Limpa a aba e atualiza com os novos dados
+    ws_sinais.clear()
+    ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
+    
+    # Formatação básica (Opcional - Negrito no cabeçalho)
+    from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFormat
+    set_frozen(ws_sinais, rows=1)
+    format_cell_range(ws_sinais, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
+
+    print("✅ Planilha atualizada com sucesso!")
+
+except Exception as e:
+    print(f"❌ Erro ao salvar na planilha: {e}")
+
+# Envio de Alertas Telegram (Já estava no seu código)
+if alertas_msg: 
+    print("📡 Enviando alertas para o Telegram...")
+    enviar_telegram("\n\n".join(alertas_msg))
+
+print("🏁 Processo concluído!")
