@@ -2,8 +2,8 @@ name: SFL Auto-Trader Bot
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
-  workflow_dispatch: 
+    - cron: '0 * * * *' # Roda de 1 em 1 hora
+  workflow_dispatch:
 
 jobs:
   run-bot:
