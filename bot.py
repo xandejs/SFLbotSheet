@@ -14,12 +14,12 @@ from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFo
 NOME_PLANILHA = "SFL 2025_10"
 REGISTROS_POR_DIA = 12 
 TAXA_MARKETPLACE = 0.1
-LUCRO_REAL_DESEJADO = 0.08
+LUCRO_REAL_DESEJADO = 0.07
 DIAS_SWING = 12            
 SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA 
 
 # Configurações de Estratégia
-MARGEM_ATENCAO = 0.05    
+MARGEM_ATENCAO = 0.035    
 TRAVA_PREJUIZO = True     
 LIMITE_BANCA = 0.25       
 TOLERANCIA_SUJEIRA = 0.15 
