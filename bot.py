@@ -3,7 +3,6 @@ import numpy as np
 import xgboost as xgb
 import gspread
 import os
-import requests
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFormat
@@ -14,30 +13,21 @@ from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFo
 NOME_PLANILHA = "SFL 2025_10"
 REGISTROS_POR_DIA = 12 
 TAXA_MARKETPLACE = 0.1
-LUCRO_REAL_DESEJADO = 0.07
+LUCRO_REAL_DESEJADO = 0.07  # 7% de lucro real alvo
 DIAS_SWING = 12            
 SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA 
 
 # Configurações de Estratégia
-MARGEM_ATENCAO = 0.035    
+MARGEM_ATENCAO = 0.035    # 3.5% para sinalizar proximidade
 TRAVA_PREJUIZO = True     
 LIMITE_BANCA = 0.25       
 TOLERANCIA_SUJEIRA = 0.15 
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 # ==============================================================================
-# FUNÇÕES DE APOIO
+# FUNÇÕES DE APOIO E INTELIGÊNCIA
 # ==============================================================================
-
-def enviar_telegram(mensagem):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try: requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": mensagem})
-    except Exception as e: print(f"Erro Telegram: {e}")
 
 def limpar_numero(texto):
     if not texto: return 0.0
@@ -49,10 +39,6 @@ def limpar_numero(texto):
         s = "".join(partes[:-1]) + "." + partes[-1]
     try: return float(s)
     except: return 0.0
-
-# ==============================================================================
-# INTELIGÊNCIA E FIFO
-# ==============================================================================
 
 def calcular_fifo_hibrido(sh, inventario_dict):
     try:
@@ -83,32 +69,41 @@ def preparar_indicadores(df_original, nome_item):
     d = df_original[df_original['Item'] == nome_item].copy()
     d['Timestamp'] = pd.to_datetime(d['Timestamp'], dayfirst=True, errors='coerce')
     d = d.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
-    if len(d) < 15: return d
+    
+    if len(d) < 30: return d
+
+    # --- JANELA MACRO (30 dias / 360 registros) para Alvos ---
+    d['Media_Macro'] = d['Price'].rolling(window=360, min_periods=30).mean()
+    d['Desvio_Macro'] = d['Price'].rolling(window=360, min_periods=30).std()
+
+    # --- JANELA MICRO (10 dias / 120 registros) para Momentum ---
+    delta = d['Price'].diff()
+    ganho = delta.clip(lower=0).rolling(window=120, min_periods=10).mean()
+    perda = -1 * delta.clip(upper=0).rolling(window=120, min_periods=10).mean()
+    d['RSI_Micro'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
+
+    # Dados para IA
     d['Season_Num'] = d['Season'].map(MAP_ESTACOES).fillna(0)
     d['Lag_1'] = d['Price'].shift(1)
-    d['Volatilidade'] = d['Price'].rolling(window=REGISTROS_POR_DIA).std()
-    d['Media_120'] = d['Price'].rolling(window=120 * REGISTROS_POR_DIA, min_periods=1).mean()
-    d['Desvio_120'] = d['Price'].rolling(window=120 * REGISTROS_POR_DIA, min_periods=1).std()
-    delta = d['Price'].diff()
-    ganho = delta.clip(lower=0).rolling(window=SHIFT_ALVO).mean()
-    perda = -1 * delta.clip(upper=0).rolling(window=SHIFT_ALVO).mean()
-    d['RSI'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
+    d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
+    
+    # Peso Temporal (Dados recentes valem mais para o XGBoost)
     max_date = d['Timestamp'].max()
     d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
-    d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
+    
     return d
 
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL
 # ==============================================================================
 
-print("🚀 Iniciando Bot com FIFO Híbrido e Alertas...")
+print("🚀 Iniciando Bot com Dual-Window Strategy...")
 escopo = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credenciais = ServiceAccountCredentials.from_json_keyfile_name("credenciais_robo.json", escopo)
 gc = gspread.authorize(credenciais)
 sh = gc.open(NOME_PLANILHA)
 
-# 1. Dados de Inventário e SFL
+# 1. Dados de Base
 inv_data = sh.worksheet("Inventario").get_all_values()
 inv_dict = {row[0]: limpar_numero(row[1]) for row in inv_data[1:]}
 
@@ -119,13 +114,12 @@ try:
 except:
     saldo_sfl = 0
 
-# 2. Cálculos de Base
 mapa_custo_fifo = calcular_fifo_hibrido(sh, inv_dict)
 trade_data = sh.worksheet("TradeLog").get_all_values()
 df_trade = pd.DataFrame(trade_data[1:], columns=trade_data[0])
 compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Qtd'].apply(lambda x: sum(map(limpar_numero, x))).to_dict()
 
-# 3. Processamento RecLog e IA
+# 2. IA e Processamento
 rec_data = sh.worksheet("RecLog").get_all_values()[1:]
 df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item', 'Price', 'Season'])
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
@@ -137,47 +131,49 @@ for item in df_bruto['Item'].unique():
     try:
         d_it = preparar_indicadores(df_bruto, item)
         cache_indicadores[item] = d_it
-        d_treino = d_it.dropna(subset=['Preco_Futuro', 'RSI'])
-        if len(d_treino) < 30: continue
-        model = xgb.XGBRegressor(n_estimators=50, max_depth=3).fit(d_treino[['Price', 'Lag_1', 'RSI']], d_treino['Preco_Futuro'], sample_weight=d_treino['Peso_Temporal'])
-        pred = model.predict(d_it[['Price', 'Lag_1', 'RSI']].tail(1))[0]
+        d_tr = d_it.dropna(subset=['Preco_Futuro', 'Media_Macro'])
+        if len(d_tr) < 30: continue
+        
+        # Treino rápido com foco na tendência mensal vs momento semanal
+        model = xgb.XGBRegressor(n_estimators=40, max_depth=3).fit(
+            d_tr[['Price', 'Lag_1', 'RSI_Micro']], d_tr['Preco_Futuro'], 
+            sample_weight=d_tr['Peso_Temporal']
+        )
+        
+        pred = model.predict(d_it[['Price', 'Lag_1', 'RSI_Micro']].tail(1))[0]
         roi = ((pred - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
         ranking.append({'Item': item, 'ROI': roi})
     except: continue
 
 df_ranking = pd.DataFrame(ranking).sort_values(by='ROI', ascending=False) if ranking else pd.DataFrame(columns=['Item', 'ROI'])
 
-# ==============================================================================
-# 4. SINAIS, ALVOS E TELEGRAM (HIERARQUIA CORRIGIDA)
-# ==============================================================================
-lista_final, alertas_msg = [], []
+# 3. Geração de Sinais
+lista_final = []
 
 for item in df_ranking.head(30)['Item']:
     d_it = cache_indicadores.get(item)
     row = d_it.iloc[-1]
     roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
     saldo_item = inv_dict.get(item, 0)
-    custo_medio = mapa_custo_fifo.get(item, row['Media_120'])
+    custo_medio = mapa_custo_fifo.get(item, row['Media_Macro'])
     
-    # Origem
+    # Origem e Preços
     sujeira = max(0, saldo_item - compras_log.get(item, 0))
     origem = 2 if (compras_log.get(item, 0) > 0 and (sujeira/saldo_item if saldo_item > 0 else 0) <= TOLERANCIA_SUJEIRA) else 1
     
-    # Definição dos Alvos
     preco_atual = row['Price']
-    alvo_in = row['Media_120'] - (2.0 * row['Desvio_120'])
-    alvo_out_estatistico = row['Media_120'] + (2.0 * row['Desvio_120'])
+    alvo_in = row['Media_Macro'] - (2.0 * row['Desvio_Macro'])
+    alvo_out_estatistico = row['Media_Macro'] + (2.0 * row['Desvio_Macro'])
     
-    # Ajuste do Alvo de Saída (Garante lucro real se for revenda)
+    # Alvo de Saída Financeiro para Revenda
     if origem == 2 and custo_medio > 0:
-        alvo_lucro_minimo = custo_medio * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
-        alvo_out = max(alvo_lucro_minimo, alvo_out_estatistico)
+        alvo_lucro = custo_medio * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
+        alvo_out = max(alvo_lucro, alvo_out_estatistico)
     else:
         alvo_out = alvo_out_estatistico
 
-    # --- Árvore de Decisão ---
+    # Decisão Hierárquica
     acao = "ESPERAR"
-    
     if preco_atual <= alvo_in:
         acao = "🟢 COMPRAR"
     elif preco_atual <= alvo_in * (1 + MARGEM_ATENCAO):
@@ -187,45 +183,22 @@ for item in df_ranking.head(30)['Item']:
     elif preco_atual >= alvo_out * (1 - MARGEM_ATENCAO):
         acao = "🎯 PERTO DA SAÍDA"
 
-    # Trava de Segurança contra Prejuízo
+    # Trava de Segurança
     if ("VENDER" in acao or "SAÍDA" in acao) and origem == 2 and preco_atual < custo_medio:
-        if roi_pred < -20: acao = "⚠️ VENDER (Stop Loss)"
-        else: acao = "ESPERAR (Prejuízo)"
-
-    # --- Geração de Alertas Telegram ---
-    if acao == "🟢 COMPRAR":
-        qtd = (saldo_sfl * LIMITE_BANCA) / preco_atual if preco_atual > 0 else 0
-        alertas_msg.append(f"🟢 COMPRA SNIPER: {item}\nPreço: {preco_atual}\nAlvo In: {alvo_in:.4f}\nSugestão: {int(qtd)} un")
-    elif acao == "🎯 PERTO DA SAÍDA" and saldo_item > 0:
-        distancia = (1 - (preco_atual / alvo_out)) * 100
-        alertas_msg.append(f"🎯 PREPARE A VENDA: {item}\nPreço: {preco_atual}\nFaltam subir {distancia:.1f}% para bater o lucro alvo!")
-    elif acao == "🔴 VENDER" and saldo_item > 0:
-        alertas_msg.append(f"🔴 HORA DE VENDER: {item}\nPreço: {preco_atual}\nCusto Médio: {custo_medio:.4f}")
+        acao = "⚠️ VENDER (Stop Loss)" if roi_pred < -20 else "ESPERAR (Prejuízo)"
 
     lista_final.append([item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4), "Revenda" if origem==2 else "Colheita", row['Season'], datetime.now().strftime("%d/%m %H:%M")])
 
-# ==============================================================================
-# 5. SALVAMENTO NA PLANILHA
-# ==============================================================================
-print(f"📝 Escrevendo {len(lista_final)} sinais na planilha...")
+# 4. Salvamento
 try:
-    try:
-        ws_sinais = sh.worksheet("Sinais_Hoje")
-    except:
-        ws_sinais = sh.add_worksheet(title="Sinais_Hoje", rows="100", cols="10")
-
-    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Atualização"]]
+    ws_sinais = sh.worksheet("Sinais_Hoje")
     ws_sinais.clear()
+    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Atualização"]]
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
-    
     set_frozen(ws_sinais, rows=1)
     format_cell_range(ws_sinais, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Sinais_Hoje atualizada!")
+    print("✅ Planilha Sinais_Hoje atualizada com Estratégia de Janela Dupla!")
 except Exception as e:
-    print(f"❌ Erro ao salvar planilha: {e}")
+    print(f"❌ Erro ao salvar: {e}")
 
-if alertas_msg: 
-    print("📡 Enviando alertas...")
-    enviar_telegram("\n\n".join(alertas_msg))
-
-print("🏁 Ciclo finalizado com sucesso!")
+print("🏁 Ciclo finalizado!")
