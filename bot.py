@@ -245,12 +245,11 @@ for item in df_ranking.head(30)['Item']:
             multiplicador_desvio = 2.0
             status_ia = "Confiança Alta"
         elif 45 <= taxa_acerto < 70:
-            multiplicador_desvio = 2.4 # Exige preço mais esmagado (Ajuste 1)
+            multiplicador_desvio = 2.4 
             status_ia = "Confiança Média"
-            # Exige ROI maior para compensar erro recente (Ajuste 3)
             if roi_pred < 12.0: roi_pred -= 5.0 
         else:
-            veto_compra = True # Bloqueia sinal de compra perigoso (Ajuste 2)
+            veto_compra = True 
             status_ia = "Veto de Segurança"
 
     # Definição Dinâmica de Alvos
@@ -271,9 +270,7 @@ for item in df_ranking.head(30)['Item']:
     if preco_atual <= alvo_in:
         acao = "🚫 COMPRA VETADA" if veto_compra else "🟢 COMPRAR"
         if acao == "🟢 COMPRAR":
-            # Guarda a proposta de preço e alvo previsto para validação futura
             alvo_saida_ia = preco_atual * (1 + (roi_pred/100))
-            # Linha corrigida abaixo (fix de aspas):
             novos_sinais_compras.append({"Item": item, "Preco": preco_atual, "Alvo": alvo_saida_ia})
     elif preco_atual <= alvo_in * (1 + MARGEM_ATENCAO):
         acao = "👀 PERTO DA ENTRADA"
@@ -282,7 +279,8 @@ for item in df_ranking.head(30)['Item']:
     elif preco_atual >= alvo_out * (1 - MARGEM_ATENCAO):
         acao = "🎯 PERTO DA SAÍDA"
 
-    if ("VENDER" in acao or "SAÍDA" in acao) and橫 origem == 2 and preco_atual < custo_medio:
+    # Linha 285 corrigida aqui (removido o caractere intruso):
+    if ("VENDER" in acao or "SAÍDA" in acao) and origem == 2 and preco_atual < custo_medio:
         acao = "⚠️ VENDER (Stop Loss)" if roi_pred < -20 else "ESPERAR (Prejuízo)"
 
     # Exibição visual da nota com base na amostragem real
@@ -290,7 +288,7 @@ for item in df_ranking.head(30)['Item']:
 
     lista_final.append([
         item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4), 
-        "Revenda" if origem==2 else "Colheita", nota_visual, datetime.now().strftime("%d/%m %H:%M")
+        "Revenda" if裝 origem==2 else "Colheita", nota_visual, datetime.now().strftime("%d/%m %H:%M")
     ])
 
 # 4. Atualizar os Sinais e Processar Gravação Real de Sinais
@@ -303,7 +301,7 @@ try:
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
     format_cell_range(ws_sinais, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje atualizada com Sucesso!")
+    print("✅ Planilha Sinais_Hoje updated successfully!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
