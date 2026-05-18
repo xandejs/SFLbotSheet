@@ -131,7 +131,7 @@ def processar_validacao_sinais(sh, df_bruto, novos_sinais_compras):
         # 2. Inserir Novos Sinais Evitando Duplicados Próximos
         novas_linhas = []
         for n in novos_sinais_compras:
-            chave = f"{n['Item']}_{datetime.now().strftime('%d%m%Y')}" # Máximo um por dia do mesmo item
+            chave = f"{n['Item']}_{datetime.now().strftime('%d%m%Y')}" 
             if df_val.empty or chave not in df_val['Chave_Unica'].values:
                 id_sinal = len(df_val) + len(novas_linhas) + 1
                 novas_linhas.append([
@@ -144,7 +144,7 @@ def processar_validacao_sinais(sh, df_bruto, novos_sinais_compras):
             df_novos = pd.DataFrame(novas_linhas, columns=dados_antigos[0])
             df_val = pd.concat([df_val, df_novos], ignore_index=True)
             
-        # Manter apenas histórico dos últimos 4 meses (Limpeza Automática inteligente)
+        # Manter apenas histórico dos últimos 4 meses
         if len(df_val) > 800:
             df_val = df_val.tail(500).reset_index(drop=True)
             
@@ -159,7 +159,7 @@ def processar_validacao_sinais(sh, df_bruto, novos_sinais_compras):
         if not df_val.empty:
             for item in df_val['Item'].unique():
                 df_item = df_val[(df_val['Item'] == item) & (df_val['Status'] != '⏳ EM ANÁLISE')]
-                if len(df_item) >= 3: # Mínimo de 3 sinais finalizados para calibrar
+                if len(df_item) >= 3: 
                     acertos = len(df_item[df_item['Status'] == '🏆 ACERTOU'])
                     taxa = (acertos / len(df_item)) * 100
                     mapa_notes = {"taxa": taxa, "qtd": len(df_item)}
@@ -233,14 +233,14 @@ for item in df_ranking.head(30)['Item']:
     preco_atual = row['Price']
     
     # --- APLICAÇÃO DO CÉREBRO HÍBRIDO (AUTOAJUSTE E VETO) ---
-    nota_item = mapa_notas_ia.get(item, {"taxa": 100.0, "qtd": 0}) # Nasce com Confiança Total
+    nota_item = mapa_notas_ia.get(item, {"taxa": 100.0, "qtd": 0}) 
     taxa_acerto = nota_item["taxa"]
     
     multiplicador_desvio = 2.0
     veto_compra = False
     status_ia = "Confiança Alta"
     
-    if nota_item["qtd"] >= 3: # Só ajusta após validar 3 ciclos completos
+    if nota_item["qtd"] >= 3: 
         if taxa_acerto >= 70:
             multiplicador_desvio = 2.0
             status_ia = "Confiança Alta"
@@ -279,16 +279,16 @@ for item in df_ranking.head(30)['Item']:
     elif preco_atual >= alvo_out * (1 - MARGEM_ATENCAO):
         acao = "🎯 PERTO DA SAÍDA"
 
-    # Linha 285 corrigida aqui (removido o caractere intruso):
     if ("VENDER" in acao or "SAÍDA" in acao) and origem == 2 and preco_atual < custo_medio:
         acao = "⚠️ VENDER (Stop Loss)" if roi_pred < -20 else "ESPERAR (Prejuízo)"
 
     # Exibição visual da nota com base na amostragem real
     nota_visual = f"{int(taxa_acerto)}% ({status_ia})" if nota_item["qtd"] >= 3 else "100% (Modo Inicial)"
 
+    # Linha 291 higienizada abaixo (fix total do if):
     lista_final.append([
         item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4), 
-        "Revenda" if裝 origem==2 else "Colheita", nota_visual, datetime.now().strftime("%d/%m %H:%M")
+        "Revenda" if origem == 2 else "Colheita", nota_visual, datetime.now().strftime("%d/%m %H:%M")
     ])
 
 # 4. Atualizar os Sinais e Processar Gravação Real de Sinais
@@ -301,7 +301,7 @@ try:
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
     format_cell_range(ws_sinais, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje updated successfully!")
+    print("✅ Planilha Sinais_Hoje atualizada com Sucesso!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
