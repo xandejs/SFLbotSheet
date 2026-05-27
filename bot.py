@@ -372,8 +372,8 @@ for item in df_ranking.head(30)['Item']:
     alvo_in = row['Media_Macro'] - (m_desvio * row['Desvio_Macro'])
     alvo_out_estatistico = row['Media_Macro'] + (m_desvio * row['Desvio_Macro'])
     
-    # Alvo de Saída Financeiro para Revenda
-    if起源 == 2 and custo_medio > 0:
+   # Alvo de Saída Financeiro para Revenda
+    if origem == 2 and custo_medio > 0:
         alvo_lucro = custo_medio * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
         alvo_out = max(alvo_lucro, alvo_out_estatistico)
     else:
