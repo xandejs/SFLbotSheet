@@ -239,7 +239,12 @@ if not df_val.empty:
             data_sinal_v = pd.to_datetime(row_val['Data_Sinal'], format="%d/%m/%Y %H:%M", errors='coerce')
             preco_sinal_v = limpar_numero(row_val['Preco_Sinal'])
             ref_fin_v = limpar_numero(row_val['Referencia_Fin'])
-            dias_p = int(limpar_numero(row_val['Dias_Passados'])) + 1
+            
+            # CORREÇÃO: Calcula os dias reais baseados no relógio, não por execução
+            if pd.notnull(data_sinal_v):
+                dias_p = (datetime.now() - data_sinal_v).days
+            else:
+                dias_p = 0  # Fallback caso a data esteja corrompida
             
             d_hist = df_bruto[df_bruto['Item'] == item_v].copy()
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
