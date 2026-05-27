@@ -98,26 +98,18 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
     Gera a string de estado discreta de 7 caracteres para o RL:
     [RSI][Volat][XGB][Estacao][Origem][Lucro][Tempo]
     """
-    # 1. RSI Discreto (0=Baixo, 1=Neutro, 2=Alto)
     rsi_val = row_mercado.get('RSI_Micro', 50)
     rsi_disc = 0 if rsi_val < 35 else (2 if rsi_val > 65 else 1)
     
-    # 2. Volatilidade Discreta (0=Baixa, 1=Alta)
     media = row_mercado.get('Media_Macro', 1)
     desvio = row_mercado.get('Desvio_Macro', 0)
     proporcao_volat = desvio / media if media > 0 else 0
     volat_disc = 1 if proporcao_volat > 0.10 else 0
     
-    # 3. Previsão do XGBoost Discreta (0=Queda, 1=Lateral, 2=Alta)
     xgb_disc = 0 if roi_pred < -4 else (2 if roi_pred > 6 else 1)
-    
-    # 4. Estação do Jogo (0 a 3)
     estacao_disc = int(row_mercado.get('Season_Num', 0))
-    
-    # 5. Origem da Custódia (1=Colheita, 2=Revenda)
     origem_disc = int(origem) 
 
-    # 6 e 7. Variáveis Dinâmicas do Portfólio (Lucro e Tempo)
     preco_atual = row_mercado.get('Price', 0)
     lucro_disc = 0
     tempo_disc = 0
@@ -193,7 +185,7 @@ df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item',
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 
 # ==============================================================================
-# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO ANTI-CONFLITO DE TAMANHO)
+# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO TEMPO REAL)
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
 headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica"]
@@ -213,17 +205,12 @@ if not val_data or len(val_data) == 0:
     val_data = [headers_val]
 
 if len(val_data) > 1:
-    # SOLUÇÃO DO BUG: Instancia o DataFrame usando os cabeçalhos físicos reais existentes na planilha
     headers_reais = [str(c).strip() for c in val_data[0]]
     df_val = pd.DataFrame(val_data[1:], columns=headers_reais)
     
-    # Injeta as colunas novas caso elas não existam no histórico antigo
-    if 'Estado_RL' not in df_val.columns:
-        df_val['Estado_RL'] = "0000100"
-    if 'Status' not in df_val.columns:
-        df_val['Status'] = "Aguardando"
+    if 'Estado_RL' not in df_val.columns: df_val['Estado_RL'] = "0000100"
+    if 'Status' not in df_val.columns: df_val['Status'] = "Aguardando"
         
-    # Força a reindexação para o padrão estrito de 11 colunas mapeado em headers_val
     df_val = df_val.reindex(columns=headers_val).fillna("")
 else:
     df_val = pd.DataFrame(columns=headers_val)
@@ -240,7 +227,12 @@ if not df_val.empty:
             data_sinal_v = pd.to_datetime(row_val['Data_Sinal'], format="%d/%m/%Y %H:%M", errors='coerce')
             preco_sinal_v = limpar_numero(row_val['Preco_Sinal'])
             ref_fin_v = limpar_numero(row_val['Referencia_Fin'])
-            dias_p = int(limpar_numero(row_val['Dias_Passados'])) + 1
+            
+            # --- SOLUÇÃO DO BUG TEMPORAL: Dias calculados matematicamente por data real ---
+            if pd.notnull(data_sinal_v):
+                dias_p = (datetime.now() - data_sinal_v).days
+            else:
+                dias_p = 0
             
             d_hist = df_bruto[df_bruto['Item'] == item_v].copy()
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
@@ -249,7 +241,7 @@ if not df_val.empty:
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
             status_v = "Aguardando"
             
-            if dias_p >= 12:
+            if dias_p >= 12:  # Agora sim representa 12 dias de calendário real passados
                 if tipo_v == "COMPRA":
                     status_v = "🏆 ACERTOU" if max_pos >= ref_fin_v else "❌ FALHOU"
                 elif tipo_v == "VENDA":
@@ -258,12 +250,12 @@ if not df_val.empty:
                     else:
                         status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
             
-            df_val.at[idx, 'Dias_Passados'] = str(dias_p)
+            df_val.at[idx, 'Dias_Passados'] = int(dias_p)  # Salva como inteiro nativo (sem aspas)
             df_val.at[idx, 'Monitoramento_12d'] = str(round(max_pos, 4))
             df_val.at[idx, 'Status'] = status_v
 
-    # Alinha a estrutura final antes de salvar
-    df_val = df_val.reindex(columns=headers_val).fillna("0000100")
+    # Garante tipagem limpa numérica antes do upload para remover as aspas de texto
+    df_val['Dias_Passados'] = pd.to_numeric(df_val['Dias_Passados'], errors='coerce').fillna(0).astype(int)
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1')
     
@@ -341,10 +333,8 @@ for item in df_ranking.head(30)['Item']:
     else:
         alvo_out = alvo_out_estatistico
 
-    # --- CÁLCULO ATIVO DO ESTADO RL ---
     estado_rl = construir_estado_rl_hibrido(row, item, origem, custo_medio, alvo_lucro, df_trade, roi_pred)
 
-    # Decisão Hierárquica Estrita
     acao = "ESPERAR"
     if preco_atual <= alvo_in:
         acao = "🟢 COMPRAR"
@@ -365,13 +355,11 @@ for item in df_ranking.head(30)['Item']:
     if acao == "🟢 COMPRAR" and mapa_veto.get(item, False):
         acao = "🚫 COMPRA VETADA"
 
-    # Salva os 9 parâmetros expandidos na Sinais_Hoje
     lista_final.append([
         item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4),
         "Revenda" if origem==2 else "Colheita", row['Season'], estado_rl, datetime.now().strftime("%d/%m %H:%M")
     ])
 
-    # --- PONTE DE APRENDIZADO: ASSOCIA ESTADO ATUAL AO SINAL DE VALIDAÇÃO ---
     if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
         dt_hoje_str = datetime.now().strftime("%d%m%Y")
         tipo_sinal = "COMPRA" if "COMPRAR" in acao else "VENDA"
@@ -403,7 +391,7 @@ try:
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
     format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje atualizada com sucesso em 9 Colunas!")
+    print("✅ Planilha Sinais_Hoje updated em 9 Colunas nativas!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
