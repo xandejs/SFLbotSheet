@@ -125,7 +125,7 @@ df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item',
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 
 # ==============================================================================
-# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (NOVO)
+# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO)
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
 headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Chave_Unica"]
@@ -137,11 +137,30 @@ except:
     ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="1000", cols="10")
     val_data = []
 
+# Corrige leituras de folhas com linhas fantasmas ou corrompidas
+if len(val_data) > 0 and not any(str(c).strip() for c in val_data[0]):
+    val_data = []
+
 if not val_data or len(val_data) == 0:
     ws_val.update(values=[headers_val], range_name='A1')
     val_data = [headers_val]
 
-df_val = pd.DataFrame(val_data[1:], columns=val_data[0]) if len(val_data) > 1 else pd.DataFrame(columns=headers_val)
+if len(val_data) > 1:
+    # Remove espaços em branco invisíveis de todos os cabeçalhos reais da folha
+    headers_reais = [str(c).strip() for c in val_data[0]]
+    
+    # Validação de consistência do cabeçalho da tabela
+    if 'Status' not in headers_reais:
+        if len(headers_reais) == len(headers_val):
+            headers_reais = headers_val
+        else:
+            headers_reais.append('Status')
+            for r in val_data[1:]:
+                while len(r) < len(headers_reais): r.append('Aguardando')
+
+    df_val = pd.DataFrame(val_data[1:], columns=headers_reais)
+else:
+    df_val = pd.DataFrame(columns=headers_val)
 
 mapa_mult_desvio = {}
 mapa_veto = {}
@@ -182,7 +201,7 @@ if not df_val.empty:
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1')
     
-    # Calcular as taxas de acerto dinâmicas (Opção B)
+    # Calcular as taxas de acerto dinâmicas
     df_concluidos = df_val[df_val['Status'].str.contains("🏆|❌|💰", na=False)].copy()
     if not df_concluidos.empty:
         def pontuar_status(r):
@@ -340,7 +359,7 @@ try:
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
     format_cell_range(ws_sinais, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje atualizada com Estratégia Híbrida e Inteligência Adaptativa!")
+    print("✅ Planilha Sinais_Hoje updated with Hybrid Strategy and Adaptive Intelligence!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
