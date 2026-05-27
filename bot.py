@@ -87,7 +87,7 @@ def preparar_indicadores(df_original, nome_item):
     d['Lag_1'] = d['Price'].shift(1)
     d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
     
-    # Peso Temporal
+    # Peso Temporal (Dados recentes valem mais para o XGBoost)
     max_date = d['Timestamp'].max()
     d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
     
@@ -98,23 +98,32 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
     Gera a string de estado discreta de 7 caracteres para o RL:
     [RSI][Volat][XGB][Estacao][Origem][Lucro][Tempo]
     """
+    # 1. RSI Discreto (3 níveis: 0=Baixo, 1=Neutro, 2=Alto)
     rsi_val = row_mercado.get('RSI_Micro', 50)
     rsi_disc = 0 if rsi_val < 35 else (2 if rsi_val > 65 else 1)
     
+    # 2. Volatilidade Discreta (0=Baixa, 1=Alta)
     media = row_mercado.get('Media_Macro', 1)
     desvio = row_mercado.get('Desvio_Macro', 0)
     proporcao_volat = desvio / media if media > 0 else 0
     volat_disc = 1 if proporcao_volat > 0.10 else 0
     
+    # 3. Previsão do XGBoost Discreta (0=Queda, 1=Lateral, 2=Alta)
     xgb_disc = 0 if roi_pred < -4 else (2 if roi_pred > 6 else 1)
+    
+    # 4. Estação do Jogo (0 a 3)
     estacao_disc = int(row_mercado.get('Season_Num', 0))
+    
+    # 5. Origem da Custódia (1=Colheita, 2=Revenda)
     origem_disc = int(origem) 
 
+    # 6 e 7. Variáveis Dinâmicas do Portfólio (Lucro e Tempo)
     preco_atual = row_mercado.get('Price', 0)
     lucro_disc = 0
     tempo_disc = 0
     
-    if origem_disc == 2:  
+    if origem_disc == 2:  # Se for um item mantido para Revenda
+        # Cálculo do Lucro Atual Discreto (0=Prejuízo, 1=Lucro Médio, 2=Meta Batida)
         if preco_atual < custo_medio:
             lucro_disc = 0
         elif preco_atual < alvo_lucro:
@@ -122,6 +131,7 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
         else:
             lucro_disc = 2
             
+        # Cálculo do Tempo de Custódia buscando no DataFrame do TradeLog
         try:
             compras_item = df_trade[(df_trade['Nome do Item'] == item) & 
                                     (df_trade['Tipo'].str.contains("Compra", case=False))]
@@ -139,14 +149,17 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
                 if dt_compra:
                     dias_em_custodia = (datetime.now() - dt_compra).days
                     if dias_em_custodia <= 3:
-                        tempo_disc = 1   
+                        tempo_disc = 1   # Ciclo Inicial
                     elif dias_em_custodia <= 8:
-                        tempo_disc = 2   
+                        tempo_disc = 2   # Ciclo Médio
                     else:
-                        tempo_disc = 3   
-                else: tempo_disc = 1
-            else: tempo_disc = 1
-        except: tempo_disc = 1
+                        tempo_disc = 3   # Alerta de Tempo Limite (>= 9 dias preso)
+                else:
+                    tempo_disc = 1
+            else:
+                tempo_disc = 1
+        except:
+            tempo_disc = 1
     else:
         lucro_disc = 0
         tempo_disc = 0
@@ -185,9 +198,10 @@ df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item',
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 
 # ==============================================================================
-# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO TEMPO REAL)
+# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO + APRENDIZADO POR REFORÇO
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
+# EXPANSÃO: Inclusão da coluna Estado_RL nos cabeçalhos de validação
 headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica"]
 
 try:
@@ -197,29 +211,27 @@ except:
     ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="1000", cols="11")
     val_data = []
 
-if len(val_data) > 0 and not any(str(c).strip() for c in val_data[0]):
-    val_data = []
-
 if not val_data or len(val_data) == 0:
     ws_val.update(values=[headers_val], range_name='A1')
     val_data = [headers_val]
 
-if len(val_data) > 1:
-    headers_reais = [str(c).strip() for c in val_data[0]]
-    df_val = pd.DataFrame(val_data[1:], columns=headers_reais)
-    
-    if 'Estado_RL' not in df_val.columns: df_val['Estado_RL'] = "0000100"
-    if 'Status' not in df_val.columns: df_val['Status'] = "Aguardando"
-        
+# MIGRAÇÃO AUTOMÁTICA DE ESQUEMA: Garante retrocompatibilidade se a tabela antiga tiver 10 colunas
+if len(val_data) > 0 and "Estado_RL" not in val_data[0]:
+    print("⚠️ Esquema antigo de 10 colunas detectado. Injetando coluna 'Estado_RL' para compatibilidade...")
+    df_val = pd.DataFrame(val_data[1:], columns=val_data[0])
+    df_val.insert(9, "Estado_RL", "") # Insere coluna vazia na penúltima posição
     df_val = df_val.reindex(columns=headers_val).fillna("")
 else:
-    df_val = pd.DataFrame(columns=headers_val)
+    df_val = pd.DataFrame(val_data[1:], columns=val_data[0]) if len(val_data) > 1 else pd.DataFrame(columns=headers_val)
 
 mapa_mult_desvio = {}
 mapa_veto = {}
 mapa_ajuste_roi = {}
+q_table = {}  # Estrutura do Cérebro RL: { "estado": {"COMPRA": valor, "VENDA": valor} }
+alpha_rl = 0.2  # Taxa de aprendizado do algoritmo Q-Learning
 
 if not df_val.empty:
+    # Atualizar linhas pendentes ("Aguardando")
     for idx, row_val in df_val.iterrows():
         if row_val['Status'] == 'Aguardando' or row_val['Status'] == '':
             item_v = row_val['Item']
@@ -227,12 +239,7 @@ if not df_val.empty:
             data_sinal_v = pd.to_datetime(row_val['Data_Sinal'], format="%d/%m/%Y %H:%M", errors='coerce')
             preco_sinal_v = limpar_numero(row_val['Preco_Sinal'])
             ref_fin_v = limpar_numero(row_val['Referencia_Fin'])
-            
-            # --- SOLUÇÃO DO BUG TEMPORAL: Dias calculados matematicamente por data real ---
-            if pd.notnull(data_sinal_v):
-                dias_p = (datetime.now() - data_sinal_v).days
-            else:
-                dias_p = 0
+            dias_p = int(limpar_numero(row_val['Dias_Passados'])) + 1
             
             d_hist = df_bruto[df_bruto['Item'] == item_v].copy()
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
@@ -241,7 +248,7 @@ if not df_val.empty:
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
             status_v = "Aguardando"
             
-            if dias_p >= 12:  # Agora sim representa 12 dias de calendário real passados
+            if dias_p >= 12:
                 if tipo_v == "COMPRA":
                     status_v = "🏆 ACERTOU" if max_pos >= ref_fin_v else "❌ FALHOU"
                 elif tipo_v == "VENDA":
@@ -250,15 +257,15 @@ if not df_val.empty:
                     else:
                         status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
             
-            df_val.at[idx, 'Dias_Passados'] = int(dias_p)  # Salva como inteiro nativo (sem aspas)
+            df_val.at[idx, 'Dias_Passados'] = str(dias_p)
             df_val.at[idx, 'Monitoramento_12d'] = str(round(max_pos, 4))
             df_val.at[idx, 'Status'] = status_v
 
-    # Garante tipagem limpa numérica antes do upload para remover as aspas de texto
-    df_val['Dias_Passados'] = pd.to_numeric(df_val['Dias_Passados'], errors='coerce').fillna(0).astype(int)
+    # Salvar de volta as atualizações estruturadas
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1')
     
+    # 1. Processamento das Estatísticas Tradicionais de Rigor
     df_concluidos = df_val[df_val['Status'].str.contains("🏆|❌|💰", na=False)].copy()
     if not df_concluidos.empty:
         def pontuar_status(r):
@@ -271,11 +278,44 @@ if not df_val.empty:
         for item_c, group in df_concluidos.groupby('Item'):
             taxa = (group['Pontos'].sum() / len(group)) * 100
             if taxa >= 70:
-                mapa_mult_desvio[item_c] = 2.0; mapa_ajuste_roi[item_c] = 0.0; mapa_veto[item_c] = False
+                mapa_mult_desvio[item_c] = 2.0
+                mapa_ajuste_roi[item_c] = 0.0
+                mapa_veto[item_c] = False
             elif taxa >= 45:
-                mapa_mult_desvio[item_c] = 2.4; mapa_ajuste_roi[item_c] = -5.0; mapa_veto[item_c] = False
+                mapa_mult_desvio[item_c] = 2.4
+                mapa_ajuste_roi[item_c] = -5.0
+                mapa_veto[item_c] = False
             else:
-                mapa_mult_desvio[item_c] = 2.4; mapa_ajuste_roi[item_c] = -5.0; mapa_veto[item_c] = True
+                mapa_mult_desvio[item_c] = 2.4
+                mapa_ajuste_roi[item_c] = -5.0
+                mapa_veto[item_c] = True
+
+        # ======================================================================
+        # NOVO: MOTOR DE APRENDIZADO POR REFORÇO (Q-TABLE ONLINE)
+        # ======================================================================
+        df_reforco = df_val[(df_val['Status'].str.contains("🏆|❌|💰", na=False)) & (df_val['Estado_RL'].astype(str).str.strip() != "")].copy()
+        
+        for _, row_r in df_reforco.iterrows():
+            st_rl = str(row_r['Estado_RL']).strip().replace("'", "")
+            acao_rl = row_r['Tipo']  # "COMPRA" ou "VENDA"
+            status_rl = row_r['Status']
+
+            # Atribuição matemática da Recompensa (Reward)
+            if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)"]:
+                recompensa = 1.0
+            elif status_rl == "💰 LUCRO (SUBIU)":
+                recompensa = 0.5
+            else:
+                recompensa = -1.0  # Penalidade severa para erros técnicos e stops
+
+            if st_rl not in q_table:
+                q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0}
+
+            # Equação de Bellman / Q-Learning para ajuste do gradiente de qualidade
+            q_atual = q_table[st_rl].get(acao_rl, 0.0)
+            q_table[st_rl][acao_rl] = q_atual + alpha_rl * (recompensa - q_atual)
+            
+        print(f"🧠 Cérebro RL Atualizado: {len(q_table)} estados de mercado memorizados pelo robô.")
 
 prox_id_sinal = len(df_val) + 1
 novas_linhas_validacao = []
@@ -294,12 +334,16 @@ for item in df_bruto['Item'].unique():
         d_tr = d_it.dropna(subset=['Preco_Futuro'] + X_cols)
         if len(d_tr) < 30: continue
         
+        # Treino com inclusão das variáveis sazonais e macro calculadas
         model = xgb.XGBRegressor(n_estimators=40, max_depth=3).fit(
-            d_tr[X_cols], d_tr['Preco_Futuro'], sample_weight=d_tr['Peso_Temporal']
+            d_tr[X_cols], d_tr['Preco_Futuro'], 
+            sample_weight=d_tr['Peso_Temporal']
         )
         
         pred = model.predict(d_it[X_cols].tail(1))[0]
         roi = ((pred - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
+        
+        # Aplicação da punição de ROI caso o item esteja com confiança média/baixa
         roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
         ranking.append({'Item': item, 'ROI': roi, 'ROI_Ajustado': roi_ajustado})
     except: continue
@@ -307,7 +351,7 @@ for item in df_bruto['Item'].unique():
 df_ranking = pd.DataFrame(ranking).sort_values(by='ROI_Ajustado', ascending=False) if ranking else pd.DataFrame(columns=['Item', 'ROI', 'ROI_Ajustado'])
 
 # ==============================================================================
-# 3. GERAÇÃO DE SINAIS HIERÁRQUICOS COM INTEGRALIZAÇÃO DE ESTADO
+# 3. GERAÇÃO DE SINAIS HIERÁRQUICOS
 # ==============================================================================
 lista_final = []
 
@@ -322,19 +366,32 @@ for item in df_ranking.head(30)['Item']:
     origem = 2 if (compras_log.get(item, 0) > 0 and (sujeira/saldo_item if saldo_item > 0 else 0) <= TOLERANCIA_SUJEIRA) else 1
     
     preco_atual = row['Price']
+    
+    # Busca do multiplicador adaptativo gerado pelo motor de rigor
     m_desvio = mapa_mult_desvio.get(item, 2.0)
     alvo_in = row['Media_Macro'] - (m_desvio * row['Desvio_Macro'])
     alvo_out_estatistico = row['Media_Macro'] + (m_desvio * row['Desvio_Macro'])
     
-    alvo_lucro = 0.0
-    if origem == 2 and custo_medio > 0:
+    # Alvo de Saída Financeiro para Revenda
+    if起源 == 2 and custo_medio > 0:
         alvo_lucro = custo_medio * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
         alvo_out = max(alvo_lucro, alvo_out_estatistico)
     else:
         alvo_out = alvo_out_estatistico
+        alvo_lucro = 0.0
 
-    estado_rl = construir_estado_rl_hibrido(row, item, origem, custo_medio, alvo_lucro, df_trade, roi_pred)
+    # Captura da String do Estado de 7 caracteres
+    estado_rl = construir_estado_rl_hibrido(
+        row_mercado=row, 
+        item=item, 
+        origem=origem, 
+        custo_medio=custo_medio, 
+        alvo_lucro=alvo_lucro, 
+        df_trade=df_trade, 
+        roi_pred=roi_pred
+    )
 
+    # Decisão Hierárquica Estrita (Bloco Principal)
     acao = "ESPERAR"
     if preco_atual <= alvo_in:
         acao = "🟢 COMPRAR"
@@ -348,38 +405,72 @@ for item in df_ranking.head(30)['Item']:
     elif preco_atual >= alvo_out * (1 - MARGEM_ATENCAO):
         acao = "🎯 PERTO DA SAÍDA"
 
+    # Camada de Sobrescrita (Segurança e Stop Loss)
     if origem == 2 and preco_atual < custo_medio:
-        if roi_pred < -20: acao = "⚠️ VENDER (Stop Loss)"
-        elif acao == "ESPERAR": acao = "ESPERAR (Prejuízo)"
+        if roi_pred < -20:
+            acao = "⚠️ VENDER (Stop Loss)"
+        elif acao == "ESPERAR":
+            acao = "ESPERAR (Prejuízo)"
 
+    # Filtro Heurístico Baseado em Taxa de Acerto Geral do Item
     if acao == "🟢 COMPRAR" and mapa_veto.get(item, False):
         acao = "🚫 COMPRA VETADA"
 
+    # ======================================================================
+    # NOVO: INTERVENÇÃO AUTÔNOMA DO CÉREBRO RL (VETO BASEADO EM EXPERIÊNCIA)
+    # ======================================================================
+    if acao == "🟢 COMPRAR" and estado_rl in q_table:
+        # Se a qualidade esperada de compra para este estado for muito negativa, aplica o veto
+        if q_table[estado_rl]["COMPRA"] < -0.3:
+            acao = "🚫 VETO DO CÉREBRO RL (Histórico de Prejuízo)"
+
+    # Inclusão da chave com aspa protetiva para preservar os zeros à esquerda no Sheets
     lista_final.append([
-        item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4),
-        "Revenda" if origem==2 else "Colheita", row['Season'], estado_rl, datetime.now().strftime("%d/%m %H:%M")
+        item, 
+        round(roi_pred, 1), 
+        acao, 
+        round(alvo_in, 4), 
+        round(alvo_out, 4), 
+        "Revenda" if origem==2 else "Colheita", 
+        row['Season'], 
+        f"'{estado_rl}", 
+        datetime.now().strftime("%d/%m %H:%M")
     ])
 
+    # --- REGISTRO DE NOVOS SINAIS PARA VALIDAÇÃO ---
     if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
         dt_hoje_str = datetime.now().strftime("%d%m%Y")
         tipo_sinal = "COMPRA" if "COMPRAR" in acao else "VENDA"
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}"
         
+        # Evita duplicados na mesma execução ou no mesmo dia na planilha
         if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
                 ref_financeira = (preco_atual * (1 + roi_pred/100)) if tipo_sinal == "COMPRA" else custo_medio
-                if "Stop Loss" in acao: chave_unica += "_STOP"
-                    
+                
+                if "Stop Loss" in acao:
+                    chave_unica += "_STOP"
+                
+                # EXPANSÃO: Gravação estruturada contendo o Estado_RL alinhado com as 11 colunas
                 novas_linhas_validacao.append([
-                    prox_id_sinal, tipo_sinal, datetime.now().strftime("%d/%m/%Y %H:%M"),
-                    item, round(preco_atual, 4), round(ref_financeira, 4), round(preco_atual, 4),
-                    "Aguardando", 0, estado_rl, chave_unica
+                    prox_id_sinal,
+                    tipo_sinal,
+                    datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    item,
+                    round(preco_atual, 4),
+                    round(ref_financeira, 4),
+                    round(preco_atual, 4),
+                    "Aguardando",
+                    0,
+                    f"'{estado_rl}", # Aspa simples protetiva contra formatação truncada do Sheets
+                    chave_unica
                 ])
                 prox_id_sinal += 1
 
+# Gravação dos novos sinais pendentes se existirem
 if novas_linhas_validacao:
     ws_val.append_rows(novas_linhas_validacao)
-    print(f"📌 {len(novas_linhas_validacao)} novos sinais acoplados ao Estado RL para monitorização.")
+    print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
 
 # ==============================================================================
 # 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁRIA
@@ -387,11 +478,13 @@ if novas_linhas_validacao:
 try:
     ws_sinais = sh.worksheet("Sinais_Hoje")
     ws_sinais.clear()
+    
     cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Estado_RL", "Atualização"]]
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
+    
     format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje updated em 9 Colunas nativas!")
+    print("✅ Planilha Sinais_Hoje atualizada com Estratégia Híbrida, Inteligência Adaptativa e Inteligência RL!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
