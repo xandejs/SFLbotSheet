@@ -193,10 +193,9 @@ df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item',
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 
 # ==============================================================================
-# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO COM PONTE RL)
+# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO ANTI-CONFLITO DE TAMANHO)
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
-# Inclusão da coluna Estado_RL no cabeçalho de validação para permitir o treino offline posterior
 headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica"]
 
 try:
@@ -214,13 +213,18 @@ if not val_data or len(val_data) == 0:
     val_data = [headers_val]
 
 if len(val_data) > 1:
+    # SOLUÇÃO DO BUG: Instancia o DataFrame usando os cabeçalhos físicos reais existentes na planilha
     headers_reais = [str(c).strip() for c in val_data[0]]
+    df_val = pd.DataFrame(val_data[1:], columns=headers_reais)
     
-    # Proteção para injetar colunas ausentes caso a tabela física esteja desatualizada
-    if 'Status' not in headers_reais: headers_reais.append('Status')
-    if 'Estado_RL' not in headers_reais: headers_reais.append('Estado_RL')
+    # Injeta as colunas novas caso elas não existam no histórico antigo
+    if 'Estado_RL' not in df_val.columns:
+        df_val['Estado_RL'] = "0000100"
+    if 'Status' not in df_val.columns:
+        df_val['Status'] = "Aguardando"
         
-    df_val = pd.DataFrame(val_data[1:], columns=headers_val if len(headers_reais) != len(headers_val) else headers_reais)
+    # Força a reindexação para o padrão estrito de 11 colunas mapeado em headers_val
+    df_val = df_val.reindex(columns=headers_val).fillna("")
 else:
     df_val = pd.DataFrame(columns=headers_val)
 
@@ -258,7 +262,7 @@ if not df_val.empty:
             df_val.at[idx, 'Monitoramento_12d'] = str(round(max_pos, 4))
             df_val.at[idx, 'Status'] = status_v
 
-    # Alinha estrutura e salva de volta
+    # Alinha a estrutura final antes de salvar
     df_val = df_val.reindex(columns=headers_val).fillna("0000100")
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1')
@@ -361,7 +365,7 @@ for item in df_ranking.head(30)['Item']:
     if acao == "🟢 COMPRAR" and mapa_veto.get(item, False):
         acao = "🚫 COMPRA VETADA"
 
-    # Salva os 9 parâmetros expandidos na Sinais_Hoje (incluindo o estado_rl)
+    # Salva os 9 parâmetros expandidos na Sinais_Hoje
     lista_final.append([
         item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4),
         "Revenda" if origem==2 else "Colheita", row['Season'], estado_rl, datetime.now().strftime("%d/%m %H:%M")
@@ -381,7 +385,7 @@ for item in df_ranking.head(30)['Item']:
                 novas_linhas_validacao.append([
                     prox_id_sinal, tipo_sinal, datetime.now().strftime("%d/%m/%Y %H:%M"),
                     item, round(preco_atual, 4), round(ref_financeira, 4), round(preco_atual, 4),
-                    "Aguardando", 0, estado_rl, chave_unica  # <--- CHAVE SALVA AQUI DENTRO!
+                    "Aguardando", 0, estado_rl, chave_unica
                 ])
                 prox_id_sinal += 1
 
@@ -395,7 +399,6 @@ if novas_linhas_validacao:
 try:
     ws_sinais = sh.worksheet("Sinais_Hoje")
     ws_sinais.clear()
-    # Cabeçalho atualizado para refletir a nova coluna 'Estado_RL'
     cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Estado_RL", "Atualização"]]
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
