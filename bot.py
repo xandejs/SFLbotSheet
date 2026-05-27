@@ -87,11 +87,79 @@ def preparar_indicadores(df_original, nome_item):
     d['Lag_1'] = d['Price'].shift(1)
     d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
     
-    # Peso Temporal (Dados recentes valem mais para o XGBoost)
+    # Peso Temporal
     max_date = d['Timestamp'].max()
     d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
     
     return d
+
+def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_lucro, df_trade, roi_pred):
+    """
+    Gera a string de estado discreta de 7 caracteres para o RL:
+    [RSI][Volat][XGB][Estacao][Origem][Lucro][Tempo]
+    """
+    # 1. RSI Discreto (0=Baixo, 1=Neutro, 2=Alto)
+    rsi_val = row_mercado.get('RSI_Micro', 50)
+    rsi_disc = 0 if rsi_val < 35 else (2 if rsi_val > 65 else 1)
+    
+    # 2. Volatilidade Discreta (0=Baixa, 1=Alta)
+    media = row_mercado.get('Media_Macro', 1)
+    desvio = row_mercado.get('Desvio_Macro', 0)
+    proporcao_volat = desvio / media if media > 0 else 0
+    volat_disc = 1 if proporcao_volat > 0.10 else 0
+    
+    # 3. Previsão do XGBoost Discreta (0=Queda, 1=Lateral, 2=Alta)
+    xgb_disc = 0 if roi_pred < -4 else (2 if roi_pred > 6 else 1)
+    
+    # 4. Estação do Jogo (0 a 3)
+    estacao_disc = int(row_mercado.get('Season_Num', 0))
+    
+    # 5. Origem da Custódia (1=Colheita, 2=Revenda)
+    origem_disc = int(origem) 
+
+    # 6 e 7. Variáveis Dinâmicas do Portfólio (Lucro e Tempo)
+    preco_atual = row_mercado.get('Price', 0)
+    lucro_disc = 0
+    tempo_disc = 0
+    
+    if origem_disc == 2:  
+        if preco_atual < custo_medio:
+            lucro_disc = 0
+        elif preco_atual < alvo_lucro:
+            lucro_disc = 1
+        else:
+            lucro_disc = 2
+            
+        try:
+            compras_item = df_trade[(df_trade['Nome do Item'] == item) & 
+                                    (df_trade['Tipo'].str.contains("Compra", case=False))]
+            if not compras_item.empty:
+                col_data = 'Timestamp' if 'Timestamp' in df_trade.columns else 'Data'
+                data_compra_str = str(compras_item.iloc[-1][col_data]).split()[0]
+                
+                dt_compra = None
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        dt_compra = datetime.strptime(data_compra_str, fmt)
+                        break
+                    except: continue
+                
+                if dt_compra:
+                    dias_em_custodia = (datetime.now() - dt_compra).days
+                    if dias_em_custodia <= 3:
+                        tempo_disc = 1   
+                    elif dias_em_custodia <= 8:
+                        tempo_disc = 2   
+                    else:
+                        tempo_disc = 3   
+                else: tempo_disc = 1
+            else: tempo_disc = 1
+        except: tempo_disc = 1
+    else:
+        lucro_disc = 0
+        tempo_disc = 0
+
+    return f"{rsi_disc}{volat_disc}{xgb_disc}{estacao_disc}{origem_disc}{lucro_disc}{tempo_disc}"
 
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL
@@ -125,19 +193,19 @@ df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item',
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 
 # ==============================================================================
-# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO)
+# MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO (CORRIGIDO COM PONTE RL)
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
-headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Chave_Unica"]
+# Inclusão da coluna Estado_RL no cabeçalho de validação para permitir o treino offline posterior
+headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica"]
 
 try:
     ws_val = sh.worksheet("Validacao_Sinais")
     val_data = ws_val.get_all_values()
 except:
-    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="1000", cols="10")
+    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="1000", cols="11")
     val_data = []
 
-# Corrige leituras de folhas com linhas fantasmas ou corrompidas
 if len(val_data) > 0 and not any(str(c).strip() for c in val_data[0]):
     val_data = []
 
@@ -146,19 +214,13 @@ if not val_data or len(val_data) == 0:
     val_data = [headers_val]
 
 if len(val_data) > 1:
-    # Remove espaços em branco invisíveis de todos os cabeçalhos reais da folha
     headers_reais = [str(c).strip() for c in val_data[0]]
     
-    # Validação de consistência do cabeçalho da tabela
-    if 'Status' not in headers_reais:
-        if len(headers_reais) == len(headers_val):
-            headers_reais = headers_val
-        else:
-            headers_reais.append('Status')
-            for r in val_data[1:]:
-                while len(r) < len(headers_reais): r.append('Aguardando')
-
-    df_val = pd.DataFrame(val_data[1:], columns=headers_reais)
+    # Proteção para injetar colunas ausentes caso a tabela física esteja desatualizada
+    if 'Status' not in headers_reais: headers_reais.append('Status')
+    if 'Estado_RL' not in headers_reais: headers_reais.append('Estado_RL')
+        
+    df_val = pd.DataFrame(val_data[1:], columns=headers_val if len(headers_reais) != len(headers_val) else headers_reais)
 else:
     df_val = pd.DataFrame(columns=headers_val)
 
@@ -167,7 +229,6 @@ mapa_veto = {}
 mapa_ajuste_roi = {}
 
 if not df_val.empty:
-    # Atualizar linhas pendentes ("Aguardando")
     for idx, row_val in df_val.iterrows():
         if row_val['Status'] == 'Aguardando' or row_val['Status'] == '':
             item_v = row_val['Item']
@@ -197,11 +258,11 @@ if not df_val.empty:
             df_val.at[idx, 'Monitoramento_12d'] = str(round(max_pos, 4))
             df_val.at[idx, 'Status'] = status_v
 
-    # Salvar de volta as atualizações
+    # Alinha estrutura e salva de volta
+    df_val = df_val.reindex(columns=headers_val).fillna("0000100")
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1')
     
-    # Calcular as taxas de acerto dinâmicas
     df_concluidos = df_val[df_val['Status'].str.contains("🏆|❌|💰", na=False)].copy()
     if not df_concluidos.empty:
         def pontuar_status(r):
@@ -214,23 +275,17 @@ if not df_val.empty:
         for item_c, group in df_concluidos.groupby('Item'):
             taxa = (group['Pontos'].sum() / len(group)) * 100
             if taxa >= 70:
-                mapa_mult_desvio[item_c] = 2.0
-                mapa_ajuste_roi[item_c] = 0.0
-                mapa_veto[item_c] = False
+                mapa_mult_desvio[item_c] = 2.0; mapa_ajuste_roi[item_c] = 0.0; mapa_veto[item_c] = False
             elif taxa >= 45:
-                mapa_mult_desvio[item_c] = 2.4
-                mapa_ajuste_roi[item_c] = -5.0
-                mapa_veto[item_c] = False
+                mapa_mult_desvio[item_c] = 2.4; mapa_ajuste_roi[item_c] = -5.0; mapa_veto[item_c] = False
             else:
-                mapa_mult_desvio[item_c] = 2.4
-                mapa_ajuste_roi[item_c] = -5.0
-                mapa_veto[item_c] = True
+                mapa_mult_desvio[item_c] = 2.4; mapa_ajuste_roi[item_c] = -5.0; mapa_veto[item_c] = True
 
 prox_id_sinal = len(df_val) + 1
 novas_linhas_validacao = []
 
 # ==============================================================================
-# 2. IA E TREINAMENTO (EXPANDIDO)
+# 2. IA E TREINAMENTO
 # ==============================================================================
 cache_indicadores = {}
 ranking = []
@@ -243,16 +298,12 @@ for item in df_bruto['Item'].unique():
         d_tr = d_it.dropna(subset=['Preco_Futuro'] + X_cols)
         if len(d_tr) < 30: continue
         
-        # Treino com inclusão das variáveis sazonais e macro calculadas
         model = xgb.XGBRegressor(n_estimators=40, max_depth=3).fit(
-            d_tr[X_cols], d_tr['Preco_Futuro'], 
-            sample_weight=d_tr['Peso_Temporal']
+            d_tr[X_cols], d_tr['Preco_Futuro'], sample_weight=d_tr['Peso_Temporal']
         )
         
         pred = model.predict(d_it[X_cols].tail(1))[0]
         roi = ((pred - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
-        
-        # Aplicação da punição de ROI caso o item esteja com confiança média/baixa
         roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
         ranking.append({'Item': item, 'ROI': roi, 'ROI_Ajustado': roi_ajustado})
     except: continue
@@ -260,7 +311,7 @@ for item in df_bruto['Item'].unique():
 df_ranking = pd.DataFrame(ranking).sort_values(by='ROI_Ajustado', ascending=False) if ranking else pd.DataFrame(columns=['Item', 'ROI', 'ROI_Ajustado'])
 
 # ==============================================================================
-# 3. GERAÇÃO DE SINAIS HIERÁRQUICOS
+# 3. GERAÇÃO DE SINAIS HIERÁRQUICOS COM INTEGRALIZAÇÃO DE ESTADO
 # ==============================================================================
 lista_final = []
 
@@ -275,8 +326,6 @@ for item in df_ranking.head(30)['Item']:
     origem = 2 if (compras_log.get(item, 0) > 0 and (sujeira/saldo_item if saldo_item > 0 else 0) <= TOLERANCIA_SUJEIRA) else 1
     
     preco_atual = row['Price']
-    
-    # Busca do multiplicador adaptativo gerado pelo motor de rigor
     m_desvio = mapa_mult_desvio.get(item, 2.0)
     alvo_in = row['Media_Macro'] - (m_desvio * row['Desvio_Macro'])
     alvo_out_estatistico = row['Media_Macro'] + (m_desvio * row['Desvio_Macro'])
@@ -287,6 +336,9 @@ for item in df_ranking.head(30)['Item']:
         alvo_out = max(alvo_lucro, alvo_out_estatistico)
     else:
         alvo_out = alvo_out_estatistico
+
+    # --- CÁLCULO ATIVO DO ESTADO RL ---
+    estado_rl = construir_estado_rl_hibrido(row, item, origem, custo_medio, alvo_lucro, df_trade, roi_pred)
 
     # Decisão Hierárquica Estrita
     acao = "ESPERAR"
@@ -302,52 +354,40 @@ for item in df_ranking.head(30)['Item']:
     elif preco_atual >= alvo_out * (1 - MARGEM_ATENCAO):
         acao = "🎯 PERTO DA SAÍDA"
 
-    # Trava de Segurança Autónoma (Correção do Bug do Stop Loss)
     if origem == 2 and preco_atual < custo_medio:
-        if roi_pred < -20:
-            acao = "⚠️ VENDER (Stop Loss)"
-        elif acao == "ESPERAR":
-            acao = "ESPERAR (Prejuízo)"
+        if roi_pred < -20: acao = "⚠️ VENDER (Stop Loss)"
+        elif acao == "ESPERAR": acao = "ESPERAR (Prejuízo)"
 
-    # Aplicação do Veto de Segurança Máximo
     if acao == "🟢 COMPRAR" and mapa_veto.get(item, False):
         acao = "🚫 COMPRA VETADA"
 
-    lista_final.append([item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4), "Revenda" if origem==2 else "Colheita", row['Season'], datetime.now().strftime("%d/%m %H:%M")])
+    # Salva os 9 parâmetros expandidos na Sinais_Hoje (incluindo o estado_rl)
+    lista_final.append([
+        item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4),
+        "Revenda" if origem==2 else "Colheita", row['Season'], estado_rl, datetime.now().strftime("%d/%m %H:%M")
+    ])
 
-    # --- REGISTRO DE NOVOS SINAIS PARA VALIDAÇÃO ---
+    # --- PONTE DE APRENDIZADO: ASSOCIA ESTADO ATUAL AO SINAL DE VALIDAÇÃO ---
     if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
         dt_hoje_str = datetime.now().strftime("%d%m%Y")
         tipo_sinal = "COMPRA" if "COMPRAR" in acao else "VENDA"
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}"
         
-        # Evita duplicados na mesma execução ou no mesmo dia na planilha
         if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
-            if not any(x[9] == chave_unica for x in novas_linhas_validacao):
+            if not any(x[10] == chave_unica for x in novas_linhas_validacao):
                 ref_financeira = (preco_atual * (1 + roi_pred/100)) if tipo_sinal == "COMPRA" else custo_medio
-                
-                # Marcação na chave se o sinal gerado foi especificamente de Stop Loss
-                if "Stop Loss" in acao:
-                    chave_unica += "_STOP"
+                if "Stop Loss" in acao: chave_unica += "_STOP"
                     
                 novas_linhas_validacao.append([
-                    prox_id_sinal,
-                    tipo_sinal,
-                    datetime.now().strftime("%d/%m/%Y %H:%M"),
-                    item,
-                    round(preco_atual, 4),
-                    round(ref_financeira, 4),
-                    round(preco_atual, 4),
-                    "Aguardando",
-                    0,
-                    chave_unica
+                    prox_id_sinal, tipo_sinal, datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    item, round(preco_atual, 4), round(ref_financeira, 4), round(preco_atual, 4),
+                    "Aguardando", 0, estado_rl, chave_unica  # <--- CHAVE SALVA AQUI DENTRO!
                 ])
                 prox_id_sinal += 1
 
-# Gravação dos novos sinais pendentes se existirem
 if novas_linhas_validacao:
     ws_val.append_rows(novas_linhas_validacao)
-    print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
+    print(f"📌 {len(novas_linhas_validacao)} novos sinais acoplados ao Estado RL para monitorização.")
 
 # ==============================================================================
 # 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁRIA
@@ -355,11 +395,12 @@ if novas_linhas_validacao:
 try:
     ws_sinais = sh.worksheet("Sinais_Hoje")
     ws_sinais.clear()
-    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Atualização"]]
+    # Cabeçalho atualizado para refletir a nova coluna 'Estado_RL'
+    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Estado_RL", "Atualização"]]
     ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
     set_frozen(ws_sinais, rows=1)
-    format_cell_range(ws_sinais, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje updated with Hybrid Strategy and Adaptive Intelligence!")
+    format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
+    print("✅ Planilha Sinais_Hoje atualizada com sucesso em 9 Colunas!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
