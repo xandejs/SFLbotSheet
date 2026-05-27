@@ -219,14 +219,21 @@ for item in df_bruto['Item'].unique():
 
 df_ranking = pd.DataFrame(ranking).sort_values(by='ROI', ascending=False) if ranking else pd.DataFrame(columns=['Item', 'ROI'])
 
-# 3. Processamento de Sinais e Aplicação do Mecanismo Híbrido
+# ==============================================================================
+# 3. PROCESSAMENTO DE SINAIS E APLICAÇÃO DO MECANISMO HÍBRIDO (CORRIGIDO)
+# ==============================================================================
 lista_final = []
 novos_sinais_compras = []
 
-for item in df_ranking.head(30)['Item']:
+# Fim do ponto cego: Captura os 15 maiores ROIs (compras) e 15 menores ROIs (vendas)
+itens_compra = df_ranking.head(15)['Item'].tolist()
+itens_venda = df_ranking.tail(15)['Item'].tolist()
+itens_para_analisar = list(set(itens_compra + itens_venda))
+
+for item in itens_para_analisar:
     d_it = cache_indicadores.get(item)
     row = d_it.iloc[-1]
-    roi_pred = df_ranking[df_ranking['Item']==item]['ROI'].values[0]
+    roi_pred = df_ranking[df_ranking['Item'] == item]['ROI'].values[0]
     saldo_item = inv_dict.get(item, 0)
     custo_medio = mapa_custo_fifo.get(item, row['Media_Macro'])
     
@@ -254,14 +261,17 @@ for item in df_ranking.head(30)['Item']:
 
     # Definição Dinâmica de Alvos
     alvo_in = row['Media_Macro'] - (multiplicador_desvio * row['Desvio_Macro'])
-    alvo_out_estatistico = row['Media_Macro'] + (2.0 * row['Desvio_Macro'])
+    
+    # Ajuste Estatístico (Sensibilidade para Colheita): Reduzido para 1.5 para capturar topos normais
+    alvo_out_estatistico = row['Media_Macro'] + (1.5 * row['Desvio_Macro'])
     
     sujeira = max(0, saldo_item - compras_log.get(item, 0))
     origem = 2 if (compras_log.get(item, 0) > 0 and (sujeira/saldo_item if saldo_item > 0 else 0) <= TOLERANCIA_SUJEIRA) else 1
     
+    # Ajuste Financeiro (Sensibilidade para Revenda): Usa min() para não travar em alvos macro irreais
     if origem == 2 and custo_medio > 0:
         alvo_lucro = custo_medio * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
-        alvo_out = max(alvo_lucro, alvo_out_estatistico)
+        alvo_out = min(alvo_lucro, alvo_out_estatistico)
     else:
         alvo_out = alvo_out_estatistico
 
@@ -279,19 +289,30 @@ for item in df_ranking.head(30)['Item']:
     elif preco_atual >= alvo_out * (1 - MARGEM_ATENCAO):
         acao = "🎯 PERTO DA SAÍDA"
 
+    # Trava de Segurança contra prejuízo em revendas
     if ("VENDER" in acao or "SAÍDA" in acao) and origem == 2 and preco_atual < custo_medio:
         acao = "⚠️ VENDER (Stop Loss)" if roi_pred < -20 else "ESPERAR (Prejuízo)"
+
+    # GATILHO FORÇADO: Realização Crítica de Lucros Líquidos (Taxa paga + 5% no bolso)
+    if saldo_item > 0 and origem == 2 and preco_atual >= custo_medio * (1 + TAXA_MARKETPLACE):
+        if preco_atual >= custo_medio * (1 + TAXA_MARKETPLACE + 0.05):  
+            if "VENDER" not in acao:
+                acao = "🔴 VENDER (Lucro Disponível)"
 
     # Exibição visual da nota com base na amostragem real
     nota_visual = f"{int(taxa_acerto)}% ({status_ia})" if nota_item["qtd"] >= 3 else "100% (Modo Inicial)"
 
-    # Linha 291 higienizada abaixo (fix total do if):
     lista_final.append([
         item, round(roi_pred, 1), acao, round(alvo_in, 4), round(alvo_out, 4), 
         "Revenda" if origem == 2 else "Colheita", nota_visual, datetime.now().strftime("%d/%m %H:%M")
     ])
 
-# 4. Atualizar os Sinais e Processar Gravação Real de Sinais
+# Ordena a lista final pelo ROI previsto para manter a estética clássica na planilha
+lista_final.sort(key=lambda x: x[1], reverse=True)
+
+# ==============================================================================
+# 4. ATUALIZAR OS SINAIS E PROCESSAR GRAVAÇÃO REAL DE SINAIS
+# ==============================================================================
 processar_validacao_sinais(sh, df_bruto, novos_sinais_compras)
 
 try:
