@@ -211,7 +211,7 @@ except:
     val_data = []
 
 if not val_data or len(val_data) == 0:
-    ws_val.update(values=[headers_val], range_name='A1')
+    ws_val.update(values=[headers_val], range_name='A1', value_input_option='USER_ENTERED')
     val_data = [headers_val]
 
 if len(val_data) > 0 and "Estado_RL" not in val_data[0]:
@@ -227,7 +227,7 @@ mapa_veto = {}
 mapa_ajuste_roi = {}
 
 # ======================================================================
-# CORREÇÃO: PERSISTÊNCIA DO CÉREBRO RL (CARREGAMENTO DO HISTÓRICO)
+# PERSISTÊNCIA DO CÉREBRO RL (CARREGAMENTO DO HISTÓRICO)
 # ======================================================================
 q_table = {}  
 alpha_rl = 0.2  
@@ -247,13 +247,13 @@ try:
 except Exception as e:
     try:
         ws_cerebro = sh.add_worksheet(title="Cerebro_RL", rows="1000", cols="3")
-        ws_cerebro.update(values=[["Estado_RL", "Q_COMPRA", "Q_VENDA"]], range_name='A1')
+        ws_cerebro.update(values=[["Estado_RL", "Q_COMPRA", "Q_VENDA"]], range_name='A1', value_input_option='USER_ENTERED')
         print("🧠 Nova aba Cerebro_RL criada com estrutura de 7 caracteres.")
     except:
         print("⚠️ Aba Cerebro_RL já existente, mas vazia ou inacessível.")
 
 if not df_val.empty:
-    # CORREÇÃO: Atualizar linhas pendentes usando Delta de Tempo Real (Não conta por execução)
+    # Atualizar linhas pendentes usando Delta de Tempo Real
     for idx, row_val in df_val.iterrows():
         if row_val['Status'] == 'Aguardando' or row_val['Status'] == '':
             item_v = row_val['Item']
@@ -283,13 +283,24 @@ if not df_val.empty:
                     else:
                         status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
             
-            df_val.at[idx, 'Dias_Passados'] = str(dias_p)
-            df_val.at[idx, 'Monitoramento_12d'] = str(round(max_pos, 4))
+            df_val.at[idx, 'Dias_Passados'] = int(dias_p)  # Salva como INTEIRO puro
+            df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  # Salva como FLOAT puro
             df_val.at[idx, 'Status'] = status_v
 
-    # Salvar de volta as atualizações estruturadas
+    # CORREÇÃO CRÍTICA: Força todas as colunas a voltarem a ser números nativos do Python antes do update
+    df_val['ID_Sinal'] = pd.to_numeric(df_val['ID_Sinal'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
+    df_val['Preco_Sinal'] = df_val['Preco_Sinal'].apply(limpar_numero)
+    df_val['Referencia_Fin'] = df_val['Referencia_Fin'].apply(limpar_numero)
+    df_val['Monitoramento_12d'] = df_val['Monitoramento_12d'].apply(limpar_numero)
+    df_val['Dias_Passados'] = pd.to_numeric(df_val['Dias_Passados'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
+    
+    # Tratamento limpo para isolar apenas 1 aspa de texto no Estado_RL e evitar duplicações
+    df_val['Estado_RL'] = df_val['Estado_RL'].astype(str).apply(lambda x: x.strip().replace("'", ""))
+    df_val['Estado_RL'] = df_val['Estado_RL'].apply(lambda x: f"'{x}" if x != "" else "")
+
+    # Salvar de volta as atualizações estruturadas sem strings fantasmas
     ws_val.clear()
-    ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1')
+    ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1', value_input_option='USER_ENTERED')
     
     # 1. Processamento das Estatísticas Tradicionais de Rigor
     df_concluidos = df_val[df_val['Status'].str.contains("🏆|❌|💰", na=False)].copy()
@@ -461,7 +472,7 @@ for item in df_ranking.head(30)['Item']:
                     chave_unica += "_STOP"
                 
                 novas_linhas_validacao.append([
-                    prox_id_sinal,
+                    int(prox_id_sinal),
                     tipo_sinal,
                     datetime.now().strftime("%d/%m/%Y %H:%M"),
                     item,
@@ -475,7 +486,6 @@ for item in df_ranking.head(30)['Item']:
                 ])
                 prox_id_sinal += 1
 
-# Gravação dos novos sinais pendentes se existirem
 if novas_linhas_validacao:
     ws_val.append_rows(novas_linhas_validacao, value_input_option='USER_ENTERED')
     print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
@@ -488,7 +498,7 @@ try:
     ws_sinais.clear()
     
     cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Estado_RL", "Atualização"]]
-    ws_sinais.update(values=(cabecalho + lista_final), range_name='A1')
+    ws_sinais.update(values=(cabecalho + lista_final), range_name='A1', value_input_option='USER_ENTERED')
     set_frozen(ws_sinais, rows=1)
     
     format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
@@ -497,7 +507,7 @@ except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
 # ==============================================================================
-# CORREÇÃO: PERSISTÊNCIA DO CÉREBRO RL (GRAVAÇÃO E SINCRONIZAÇÃO DA Q-TABLE)
+# PERSISTÊNCIA DO CÉREBRO RL (GRAVAÇÃO E SINCRONIZAÇÃO DA Q-TABLE)
 # ==============================================================================
 try:
     ws_cerebro = sh.worksheet("Cerebro_RL")
@@ -511,7 +521,7 @@ try:
             round(acoes.get("VENDA", 0.0), 4)
         ])
         
-    ws_cerebro.update(values=cerebro_linhas, range_name='A1')
+    ws_cerebro.update(values=cerebro_linhas, range_name='A1', value_input_option='USER_ENTERED')
     set_frozen(ws_cerebro, rows=1)
     format_cell_range(ws_cerebro, 'A1:C1', CellFormat(textFormat=TextFormat(bold=True)))
     print("✅ Memória de Longo Prazo (Cerebro_RL) sincronizada e salva com sucesso!")
