@@ -3,7 +3,7 @@ import numpy as np
 import xgboost as xgb
 import gspread
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFormat
 
@@ -28,6 +28,11 @@ MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 # ==============================================================================
 # FUNÇÕES DE APOIO E INTELIGÊNCIA
 # ==============================================================================
+
+def obter_agora_brt():
+    """Retorna o datetime atual convertido para o Horário de Brasília (BRT),
+    limpando o tzinfo para manter total compatibilidade com o Pandas."""
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-3))).replace(tzinfo=None)
 
 def limpar_numero(texto):
     if not texto: return 0.0
@@ -147,7 +152,7 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
                     except: continue
                 
                 if dt_compra:
-                    dias_em_custodia = (datetime.now() - dt_compra).days
+                    dias_em_custodia = (obter_agora_brt() - dt_compra).days
                     if dias_em_custodia <= 3:
                         tempo_disc = 1   # Ciclo Inicial
                     elif dias_em_custodia <= 8:
@@ -253,7 +258,7 @@ except Exception as e:
         print("⚠️ Aba Cerebro_RL já existente, mas vazia ou inacessível.")
 
 if not df_val.empty:
-    # Atualizar linhas pendentes usando Delta de Tempo Real
+    # Atualizar linhas pendentes usando Delta de Tempo Real em BRT
     for idx, row_val in df_val.iterrows():
         if row_val['Status'] == 'Aguardando' or row_val['Status'] == '':
             item_v = row_val['Item']
@@ -263,7 +268,7 @@ if not df_val.empty:
             ref_fin_v = limpar_numero(row_val['Referencia_Fin'])
             
             if pd.notnull(data_sinal_v):
-                dias_p = (datetime.now() - data_sinal_v).days
+                dias_p = (obter_agora_brt() - data_sinal_v).days
             else:
                 dias_p = 0  
             
@@ -271,14 +276,14 @@ if not df_val.empty:
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
             df_pos_sinal = d_hist[d_hist['Timestamp'] >= data_sinal_v]
             
-           max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
+            max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
             status_v = "Aguardando"
             
             if tipo_v == "COMPRA":
                 if max_pos >= ref_fin_v:
-                    status_v = "🏆 ACERTOU"  # Bateu no alvo? Ganha o veredito imediato!
+                    status_v = "🏆 ACERTOU"  
                 elif dias_p >= 12:
-                    status_v = "❌ FALHOU"   # Acabou o tempo e não bateu? Falhou.
+                    status_v = "❌ FALHOU"   
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
@@ -287,22 +292,22 @@ if not df_val.empty:
                     if dias_p >= 12:
                         status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
             
-            df_val.at[idx, 'Dias_Passados'] = int(dias_p)  # Salva como INTEIRO puro
-            df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  # Salva como FLOAT puro
+            df_val.at[idx, 'Dias_Passados'] = int(dias_p)  
+            df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  
             df_val.at[idx, 'Status'] = status_v
 
-    # CORREÇÃO CRÍTICA: Força todas as colunas a voltarem a ser números nativos do Python antes do update
+    # Força todas as colunas a voltarem a ser números nativos do Python antes do update
     df_val['ID_Sinal'] = pd.to_numeric(df_val['ID_Sinal'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
     df_val['Preco_Sinal'] = df_val['Preco_Sinal'].apply(limpar_numero)
     df_val['Referencia_Fin'] = df_val['Referencia_Fin'].apply(limpar_numero)
     df_val['Monitoramento_12d'] = df_val['Monitoramento_12d'].apply(limpar_numero)
     df_val['Dias_Passados'] = pd.to_numeric(df_val['Dias_Passados'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
     
-    # Tratamento limpo para isolar apenas 1 aspa de texto no Estado_RL e evitar duplicações
+    # Isolamento limpo do Estado_RL
     df_val['Estado_RL'] = df_val['Estado_RL'].astype(str).apply(lambda x: x.strip().replace("'", ""))
     df_val['Estado_RL'] = df_val['Estado_RL'].apply(lambda x: f"'{x}" if x != "" else "")
 
-    # Salvar de volta as atualizações estruturadas sem strings fantasmas
+    # Salvar de volta as atualizações estruturadas
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1', value_input_option='USER_ENTERED')
     
@@ -460,11 +465,11 @@ for item in df_ranking.head(30)['Item']:
         "Revenda" if origem==2 else "Colheita", 
         row['Season'], 
         f"'{estado_rl}", 
-        datetime.now().strftime("%d/%m %H:%M")
+        obter_agora_brt().strftime("%d/%m %H:%M")
     ])
 
     if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
-        dt_hoje_str = datetime.now().strftime("%d%m%Y")
+        dt_hoje_str = obter_agora_brt().strftime("%d%m%Y")
         tipo_sinal = "COMPRA" if "COMPRAR" in acao else "VENDA"
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}"
         
@@ -478,7 +483,7 @@ for item in df_ranking.head(30)['Item']:
                 novas_linhas_validacao.append([
                     int(prox_id_sinal),
                     tipo_sinal,
-                    datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    obter_agora_brt().strftime("%d/%m/%Y %H:%M"),
                     item,
                     round(preco_atual, 4),
                     round(ref_financeira, 4),
@@ -495,7 +500,7 @@ if novas_linhas_validacao:
     print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
 
 # ==============================================================================
-# 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁRIA
+# 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁREA
 # ==============================================================================
 try:
     ws_sinais = sh.worksheet("Sinais_Hoje")
@@ -506,7 +511,7 @@ try:
     set_frozen(ws_sinais, rows=1)
     
     format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje atualizada com Estratégia Híbrida, Inteligência Adaptativa e Inteligência RL!")
+    print("✅ Planilha Sinais_Hoje atualizada com Horário de Brasília (BRT)!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
@@ -528,7 +533,7 @@ try:
     ws_cerebro.update(values=cerebro_linhas, range_name='A1', value_input_option='USER_ENTERED')
     set_frozen(ws_cerebro, rows=1)
     format_cell_range(ws_cerebro, 'A1:C1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Memória de Longo Prazo (Cerebro_RL) sincronizada e salva com sucesso!")
+    print("✅ Memória de Longo Prazo (Cerebro_RL) sincronizada!")
 except Exception as e:
     print(f"❌ Erro ao salvar a Q-Table em Cerebro_RL: {e}")
 
