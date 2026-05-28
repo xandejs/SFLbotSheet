@@ -475,8 +475,9 @@ for item in df_ranking.head(30)['Item']:
                 ])
                 prox_id_sinal += 1
 
+# Gravação dos novos sinais pendentes se existirem
 if novas_linhas_validacao:
-    ws_val.append_rows(novas_linhas_validacao)
+    ws_val.append_rows(novas_linhas_validacao, value_input_option='USER_ENTERED')
     print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
 
 # ==============================================================================
