@@ -271,16 +271,20 @@ if not df_val.empty:
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
             df_pos_sinal = d_hist[d_hist['Timestamp'] >= data_sinal_v]
             
-            max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
+           max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
             status_v = "Aguardando"
             
-            if dias_p >= 12:
-                if tipo_v == "COMPRA":
-                    status_v = "🏆 ACERTOU" if max_pos >= ref_fin_v else "❌ FALHOU"
-                elif tipo_v == "VENDA":
-                    if "_STOP" in str(row_val['Chave_Unica']):
+            if tipo_v == "COMPRA":
+                if max_pos >= ref_fin_v:
+                    status_v = "🏆 ACERTOU"  # Bateu no alvo? Ganha o veredito imediato!
+                elif dias_p >= 12:
+                    status_v = "❌ FALHOU"   # Acabou o tempo e não bateu? Falhou.
+            elif tipo_v == "VENDA":
+                if "_STOP" in str(row_val['Chave_Unica']):
+                    if dias_p >= 12:
                         status_v = "❌ FALHOU (STOP LOSS)"
-                    else:
+                else:
+                    if dias_p >= 12:
                         status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
             
             df_val.at[idx, 'Dias_Passados'] = int(dias_p)  # Salva como INTEIRO puro
