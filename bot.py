@@ -279,11 +279,16 @@ if not df_val.empty:
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
             status_v = "Aguardando"
             
+            # --- BLOCO DE VALIDAÇÃO COM FILTRO HÍBRIDO (PISO VS TETO) ---
             if tipo_v == "COMPRA":
                 if max_pos >= ref_fin_v:
                     status_v = "🏆 ACERTOU"  
                 elif dias_p >= 12:
-                    status_v = "❌ FALHOU"   
+                    piso_lucro_real = preco_sinal_v * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
+                    if max_pos >= piso_lucro_real:
+                        status_v = "💰 LUCRO PARCIAL"
+                    else:
+                        status_v = "❌ FALHOU"   
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
@@ -317,7 +322,7 @@ if not df_val.empty:
         def pontuar_status(r):
             st = r['Status']
             if st in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)"]: return 1.0
-            if st == "💰 LUCRO (SUBIU)": return 0.5
+            if st in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]: return 0.5
             return 0.0
             
         df_concluidos['Pontos'] = df_concluidos.apply(pontuar_status, axis=1)
@@ -337,7 +342,7 @@ if not df_val.empty:
                 mapa_veto[item_c] = True
 
         # ======================================================================
-        # MOTOR DE APRENDIZADO POR REFORÇO (Q-TABLE ONLINE)
+        # MOTOR DE APRENDIZADO POR REFORÇO (Q-TABLE ONLINE COM RECOMPENSA HÍBRIDA)
         # ======================================================================
         df_reforco = df_val[(df_val['Status'].str.contains("🏆|❌|💰", na=False)) & (df_val['Estado_RL'].astype(str).str.strip() != "")].copy()
         
@@ -348,7 +353,7 @@ if not df_val.empty:
 
             if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)"]:
                 recompensa = 1.0
-            elif status_rl == "💰 LUCRO (SUBIU)":
+            elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
                 recompensa = 0.5
             else:
                 recompensa = -1.0  
@@ -511,7 +516,7 @@ try:
     set_frozen(ws_sinais, rows=1)
     
     format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje atualizada com Horário de Brasília (BRT)!")
+    print("✅ Planilha Sinais_Hoje updated com Horário de Brasília (BRT)!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
 
