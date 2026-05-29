@@ -475,7 +475,7 @@ for item in df_ranking.head(30)['Item']:
         
         if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
-                ref_financeira = (preco_atual * (1 + roi_pred/100)) if tipo_sinal == "COMPRA" else custo_medio
+                ref_financeira = alvo_out if tipo_sinal == "COMPRA" else custo_medio
                 
                 if "Stop Loss" in acao:
                     chave_unica += "_STOP"
