@@ -478,6 +478,9 @@ for item in df_ranking.head(30)['Item']:
         dt_hoje_str = obter_agora_brt().strftime("%d%m%Y")
         tipo_sinal = "COMPRA" if "COMPRAR" in acao else "VENDA"
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}"
+
+        linha_sinais_hoje = len(lista_final) + 1
+        enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
         
         if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
