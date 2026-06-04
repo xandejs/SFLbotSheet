@@ -3,6 +3,7 @@ import numpy as np
 import xgboost as xgb
 import gspread
 import os
+import requests
 from datetime import datetime, timedelta, timezone
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFormat
