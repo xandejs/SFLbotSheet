@@ -3,6 +3,7 @@ import numpy as np
 import xgboost as xgb
 import gspread
 import os
+import requests
 from datetime import datetime, timedelta, timezone
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFormat
@@ -543,3 +544,38 @@ except Exception as e:
     print(f"❌ Erro ao salvar a Q-Table em Cerebro_RL: {e}")
 
 print("🏁 Ciclo finalizado com sucesso!")
+
+def enviar_telegram(acao, ativo, preco, linha):
+    """Envia o alerta de operação diretamente para o canal/chat do Telegram."""
+    token = "8715722660:AAGgJSl2w2RpM0kxZ9Y4MFK4lHpDZaLyQmw"
+    chat_id = "873167793"
+    
+    # Formata o preço com 5 casas decimais e troca ponto por vírgula
+    preco_formatado = f"{preco:.5f}".replace('.', ',')
+    
+    # Define o emoji principal com base no sinal
+    if "COMPRAR" in acao.upper():
+        emoji = "🟢"
+    elif "STOP" in acao.upper():
+        emoji = "⚠️"
+    else:
+        emoji = "🔴"
+        
+    hora_formatada = obter_agora_brt().strftime("%d/%m %H:%M:%S")
+    
+    mensagem = (
+        f"{emoji} *ALERTA DE OPERAÇÃO* {emoji}\n\n"
+        f"*Ação:* {acao.upper()}\n"
+        f"*Ativo:* {ativo}\n"
+        f"*Preço:* {preco_formatado}\n"
+        f"*Linha:* {linha}\n"
+        f"*Hora:* {hora_formatada}"
+    )
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": mensagem, "parse_mode": "Markdown"}
+    
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"❌ Erro ao enviar mensagem para o Telegram: {e}")
