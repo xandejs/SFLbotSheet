@@ -69,7 +69,7 @@ def enviar_telegram(acao, ativo, preco, linha):
         requests.post(url, json=payload)
     except Exception as e:
         print(f"❌ Erro ao enviar mensagem para o Telegram: {e}")
-        
+
 def limpar_numero(texto):
     if not texto: return 0.0
     s = str(texto).strip()
@@ -516,6 +516,10 @@ for item in df_ranking.head(30)['Item']:
         
         if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
+                
+                linha_sinais_hoje = len(lista_final) + 1
+                enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
+                
                 ref_financeira = alvo_out if tipo_sinal == "COMPRA" else custo_medio
                 
                 if "Stop Loss" in acao:
