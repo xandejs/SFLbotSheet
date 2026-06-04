@@ -34,6 +34,41 @@ def obter_agora_brt():
     limpando o tzinfo para manter total compatibilidade com o Pandas."""
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-3))).replace(tzinfo=None)
 
+def enviar_telegram(acao, ativo, preco, linha):
+    """Envia o alerta de operação diretamente para o canal/chat do Telegram."""
+    token = "8715722660:AAGgJSl2w2RpM0kxZ9Y4MFK4lHpDZaLyQmw"
+    chat_id = "873167793"
+    
+    # Formata o preço com 5 casas decimais e troca ponto por vírgula
+    preco_formatado = f"{preco:.5f}".replace('.', ',')
+    
+    # Define o emoji principal com base no sinal
+    if "COMPRAR" in acao.upper():
+        emoji = "🟢"
+    elif "STOP" in acao.upper():
+        emoji = "⚠️"
+    else:
+        emoji = "🔴"
+        
+    hora_formatada = obter_agora_brt().strftime("%d/%m %H:%M:%S")
+    
+    mensagem = (
+        f"{emoji} *ALERTA DE OPERAÇÃO* {emoji}\n\n"
+        f"*Ação:* {acao.upper()}\n"
+        f"*Ativo:* {ativo}\n"
+        f"*Preço:* {preco_formatado}\n"
+        f"*Linha:* {linha}\n"
+        f"*Hora:* {hora_formatada}"
+    )
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": mensagem, "parse_mode": "Markdown"}
+    
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"❌ Erro ao enviar mensagem para o Telegram: {e}")
+        
 def limpar_numero(texto):
     if not texto: return 0.0
     s = str(texto).strip()
