@@ -12,7 +12,7 @@ from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFo
 # CONFIGURAÇÕES E CONSTANTES
 # ==============================================================================
 NOME_PLANILHA = "SFL 2025_10"
-REGISTROS_POR_DIA = 12 
+REGISTROS_POR_DIA = 24 
 TAXA_MARKETPLACE = 0.1
 LUCRO_REAL_DESEJADO = 0.07  # 7% de lucro real alvo
 DIAS_SWING = 12            
@@ -111,16 +111,20 @@ def preparar_indicadores(df_original, nome_item):
     d['Timestamp'] = pd.to_datetime(d['Timestamp'], dayfirst=True, errors='coerce')
     d = d.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
     
-    if len(d) < 30: return d
+    # Define o tamanho das janelas dinamicamente com base na frequência diária
+    janela_macro_dinamica = 30 * REGISTROS_POR_DIA  
+    janela_micro_dinamica = 10 * REGISTROS_POR_DIA  
+    
+    if len(d) < janela_micro_dinamica: return d
 
-    # --- JANELA MACRO (30 dias / 360 registros) para Alvos ---
-    d['Media_Macro'] = d['Price'].rolling(window=360, min_periods=30).mean()
-    d['Desvio_Macro'] = d['Price'].rolling(window=360, min_periods=30).std()
+    # --- JANELA MACRO (30 dias dinâmicos) para Alvos ---
+    d['Media_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=30).mean()
+    d['Desvio_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=30).std()
 
-    # --- JANELA MICRO (10 dias / 120 registros) para Momentum ---
+    # --- JANELA MICRO (10 dias dinâmicos) para Momentum ---
     delta = d['Price'].diff()
-    ganho = delta.clip(lower=0).rolling(window=120, min_periods=10).mean()
-    perda = -1 * delta.clip(upper=0).rolling(window=120, min_periods=10).mean()
+    ganho = delta.clip(lower=0).rolling(window=janela_micro_dinamica, min_periods=10).mean()
+    perda = -1 * delta.clip(upper=0).rolling(window=janela_micro_dinamica, min_periods=10).mean()
     d['RSI_Micro'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
 
     # Dados para IA
