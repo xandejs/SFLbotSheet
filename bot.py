@@ -111,20 +111,27 @@ def preparar_indicadores(df_original, nome_item):
     d['Timestamp'] = pd.to_datetime(d['Timestamp'], dayfirst=True, errors='coerce')
     d = d.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
     
+    # ADIÇÃO DEFENSIVA: Força a criação das colunas do modelo populadas com NaN.
+    # Se o histórico for curto e o 'return d' antecipado disparar, evita KeyError na IA externa.
+    for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro', 'Season_Num', 'Lag_1', 'Preco_Futuro', 'Peso_Temporal']:
+        d[col] = np.nan
+        
     # Define o tamanho das janelas dinamicamente com base na frequência diária
     janela_macro_dinamica = 30 * REGISTROS_POR_DIA  
     janela_micro_dinamica = 10 * REGISTROS_POR_DIA  
     
     if len(d) < janela_micro_dinamica: return d
 
-    # --- JANELA MACRO (30 dias dinâmicos) para Alvos ---
-    d['Media_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=30).mean()
-    d['Desvio_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=30).std()
+   # --- JANELA MACRO (30 dias dinâmicos) para Alvos ---
+    # Alterado min_periods para 120 (Exige pelo menos 5 dias cheios de dados na frequência de 24 registros/dia)
+    d['Media_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=120).mean()
+    d['Desvio_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=120).std()
 
     # --- JANELA MICRO (10 dias dinâmicos) para Momentum ---
+    # Alterado min_periods para 48 (Exige pelo menos 2 dias cheios de dados na frequência de 24 registros/dia)
     delta = d['Price'].diff()
-    ganho = delta.clip(lower=0).rolling(window=janela_micro_dinamica, min_periods=10).mean()
-    perda = -1 * delta.clip(upper=0).rolling(window=janela_micro_dinamica, min_periods=10).mean()
+    ganho = delta.clip(lower=0).rolling(window=janela_micro_dinamica, min_periods=48).mean()
+    perda = -1 * delta.clip(upper=0).rolling(window=janela_micro_dinamica, min_periods=48).mean()
     d['RSI_Micro'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
 
     # Dados para IA
@@ -297,6 +304,9 @@ except Exception as e:
     except:
         print("⚠️ Aba Cerebro_RL já existente, mas vazia ou inacessível.")
 
+# Lista para capturar APENAS os índices que mudaram de estado NESTE ciclo específico
+indices_concluidos_neste_ciclo = []
+
 if not df_val.empty:
     # Atualizar linhas pendentes usando Delta de Tempo Real em BRT
     for idx, row_val in df_val.iterrows():
@@ -332,7 +342,11 @@ if not df_val.empty:
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
-                        status_v = "❌ FALHOU (STOP LOSS)"
+                        # CORREÇÃO CRÍTICA STOP LOSS: Se após o stop o preço continuou abaixo dele, o stop salvou capital!
+                        if max_pos <= preco_sinal_v:
+                            status_v = "🏆 ACERTOU (STOP PROTETIVO)"
+                        else:
+                            status_v = "❌ FALHOU (STOP PREMATURO)"
                 else:
                     if dias_p >= 12:
                         status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
@@ -340,6 +354,10 @@ if not df_val.empty:
             df_val.at[idx, 'Dias_Passados'] = int(dias_p)  
             df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  
             df_val.at[idx, 'Status'] = status_v
+
+            # Se o status foi finalizado AGORA, guardamos para atualizar o RL sem duplicidade
+            if "🏆" in status_v or "❌" in status_v or "💰" in status_v:
+                indices_concluidos_neste_ciclo.append(idx)
 
     # Força todas as colunas a voltarem a ser números nativos do Python antes do update
     df_val['ID_Sinal'] = pd.to_numeric(df_val['ID_Sinal'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
@@ -361,8 +379,8 @@ if not df_val.empty:
     if not df_concluidos.empty:
         def pontuar_status(r):
             st = r['Status']
-            if st in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)"]: return 1.0
-            if st in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]: return 0.5
+            if "🏆 ACERTOU" in st: return 1.0
+            if "💰 LUCRO" in st: return 0.5
             return 0.0
             
         df_concluidos['Pontos'] = df_concluidos.apply(pontuar_status, axis=1)
@@ -382,27 +400,32 @@ if not df_val.empty:
                 mapa_veto[item_c] = True
 
         # ======================================================================
-        # MOTOR DE APRENDIZADO POR REFORÇO (Q-TABLE ONLINE COM RECOMPENSA HÍBRIDA)
+        # MOTOR DE APRENDIZADO POR REFORÇO CORRIGIDO (APENAS SINAIS DO CICLO ATUAL)
         # ======================================================================
-        df_reforco = df_val[(df_val['Status'].str.contains("🏆|❌|💰", na=False)) & (df_val['Estado_RL'].astype(str).str.strip() != "")].copy()
-        
-        for _, row_r in df_reforco.iterrows():
-            st_rl = str(row_r['Estado_RL']).strip().replace("'", "")
-            acao_rl = row_r['Tipo']  
-            status_rl = row_r['Status']
+        if indices_concluidos_neste_ciclo:
+            df_reforco = df_val.loc[indices_concluidos_neste_ciclo].copy()
+            df_reforco = df_reforco[df_reforco['Estado_RL'].astype(str).str.strip() != ""].copy()
+            
+            for _, row_r in df_reforco.iterrows():
+                st_rl = str(row_r['Estado_RL']).strip().replace("'", "")
+                acao_rl = row_r['Tipo']  
+                status_rl = row_r['Status']
 
-            if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)"]:
-                recompensa = 1.0
-            elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
-                recompensa = 0.5
-            else:
-                recompensa = -1.0  
+                # Mapeamento justo de recompensas incluindo a nova métrica de Stop Loss
+                if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
+                    recompensa = 1.0
+                elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
+                    recompensa = 0.5
+                else:
+                    recompensa = -1.0  
 
-            if st_rl not in q_table:
-                q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0}
+                if st_rl not in q_table:
+                    q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0}
 
-            q_atual = q_table[st_rl].get(acao_rl, 0.0)
-            q_table[st_rl][acao_rl] = q_atual + alpha_rl * (recompensa - q_atual)
+                q_atual = q_table[st_rl].get(acao_rl, 0.0)
+                q_table[st_rl][acao_rl] = q_atual + alpha_rl * (recompensa - q_atual)
+                
+            print(f"🧠 Cérebro RL Atualizado de forma incremental: {len(df_reforco)} novos estados processados.")
             
         print(f"🧠 Cérebro RL Atualizado internamente: {len(q_table)} estados de mercado na memória RAM.")
 
@@ -459,7 +482,8 @@ for item in df_ranking.head(30)['Item']:
     alvo_out_estatistico = row['Media_Macro'] + (m_desvio * row['Desvio_Macro'])
     
     if origem == 2 and custo_medio > 0:
-        alvo_lucro = custo_medio * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
+        # Correção matemática para embutir a taxa sobre o preço de venda final
+        alvo_lucro = (custo_medio * (1 + LUCRO_REAL_DESEJADO)) / (1 - TAXA_MARKETPLACE)
         alvo_out = max(alvo_lucro, alvo_out_estatistico)
     else:
         alvo_out = alvo_out_estatistico
