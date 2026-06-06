@@ -41,7 +41,7 @@ def enviar_telegram(acao, ativo, preco, linha):
     chat_id = "873167793"
     
     # Formata o preço com 5 casas decimais e troca ponto por vírgula
-    preco_formatado = f"{preco:.5f}".replace('.', ',')
+    preco_formatado = f"{preco:.4f}".replace('.', ',')
     
     # Define o emoji principal com base no sinal
     if "COMPRAR" in acao.upper():
