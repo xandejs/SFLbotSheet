@@ -25,7 +25,6 @@ LIMITE_BANCA = 0.25
 TOLERANCIA_SUJEIRA = 0.15 
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
-HEADERS_AUDIT = ["Timestamp", "Item", "MAE", "RMSE", "Acerto_Direcao_%", "N_Treino", "N_Teste", "ROI_Prev_%"]
 
 # ==============================================================================
 # FUNÇÕES DE APOIO E INTELIGÊNCIA
@@ -108,73 +107,75 @@ def calcular_fifo_hibrido(sh, inventario_dict):
         print(f"Erro FIFO: {e}"); return {}
 
 def preparar_indicadores(df_original, nome_item):
-    """
-    Prepara os indicadores técnicos e divide os dados em treino/teste
-    respeitando a ordem temporal (sem data leakage).
-    """
     d = df_original[df_original['Item'] == nome_item].copy()
     d['Timestamp'] = pd.to_datetime(d['Timestamp'], dayfirst=True, errors='coerce')
     d = d.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
-
-    for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro',
-                'Season_Num', 'Lag_1', 'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
+    
+    # ADIÇÃO DEFENSIVA: Força a criação das colunas do modelo populadas com NaN.
+    # Se o histórico for curto e o 'return d' antecipado disparar, evita KeyError na IA externa.
+    for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro', 'Season_Num', 'Lag_1', 'Preco_Futuro', 'Peso_Temporal']:
         d[col] = np.nan
-    d['is_holdout'] = False
+        
+    # Define o tamanho das janelas dinamicamente com base na frequência diária
+    janela_macro_dinamica = 30 * REGISTROS_POR_DIA  
+    janela_micro_dinamica = 10 * REGISTROS_POR_DIA  
+    
+    if len(d) < janela_micro_dinamica: return d
 
-    janela_macro_dinamica = 30 * REGISTROS_POR_DIA   
-    janela_micro_dinamica = 10 * REGISTROS_POR_DIA   
+   # --- JANELA MACRO (30 dias dinâmicos) para Alvos ---
+    # Alterado min_periods para 120 (Exige pelo menos 5 dias cheios de dados na frequência de 24 registros/dia)
+    d['Media_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=120).mean()
+    d['Desvio_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=120).std()
 
-    if len(d) < janela_micro_dinamica:
-        return d
-
-    d['Media_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=240).mean()
-    d['Desvio_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=240).std()
-
+    # --- JANELA MICRO (10 dias dinâmicos) para Momentum ---
+    # Alterado min_periods para 48 (Exige pelo menos 2 dias cheios de dados na frequência de 24 registros/dia)
     delta = d['Price'].diff()
     ganho = delta.clip(lower=0).rolling(window=janela_micro_dinamica, min_periods=48).mean()
     perda = -1 * delta.clip(upper=0).rolling(window=janela_micro_dinamica, min_periods=48).mean()
+    d['RSI_Micro'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
 
-    rsi_raw = 100 - (100 / (1 + (ganho / perda.replace(0, np.nan))))
-    d['RSI_Micro'] = rsi_raw.fillna(100)   
-
+    # Dados para IA
     d['Season_Num'] = d['Season'].map(MAP_ESTACOES).fillna(0)
-    d['Lag_1']       = d['Price'].shift(1)
-    d['Preco_Futuro']= d['Price'].shift(-SHIFT_ALVO)
-
+    d['Lag_1'] = d['Price'].shift(1)
+    d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
+    
+    # Peso Temporal (Dados recentes valem mais para o XGBoost)
     max_date = d['Timestamp'].max()
     d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
-
-    # ==========================================================================
-    # CORREÇÃO DA JANELA DE TESTE (HOLDOUT)
-    # ==========================================================================
-    # O "ponto cego" real são as últimas SHIFT_ALVO linhas (onde o futuro é desconhecido).
-    # Portanto, nossa janela de validação deve ser o bloco IMEDIATAMENTE ANTERIOR a ele.
-    if len(d) > (2 * SHIFT_ALVO):
-        inicio_teste = len(d) - (2 * SHIFT_ALVO)
-        fim_teste = len(d) - SHIFT_ALVO
-        d.iloc[inicio_teste:fim_teste, d.columns.get_loc('is_holdout')] = True
-
+    
     return d
 
 def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_lucro, df_trade, roi_pred):
-    """Gera a string de estado discreta de 7 caracteres para o RL."""
+    """
+    Gera a string de estado discreta de 7 caracteres para o RL:
+    [RSI][Volat][XGB][Estacao][Origem][Lucro][Tempo]
+    """
+    # 1. RSI Discreto (3 níveis: 0=Baixo, 1=Neutro, 2=Alto)
     rsi_val = row_mercado.get('RSI_Micro', 50)
     rsi_disc = 0 if rsi_val < 35 else (2 if rsi_val > 65 else 1)
     
+    # 2. Volatilidade Discreta (0=Baixa, 1=Alta)
     media = row_mercado.get('Media_Macro', 1)
     desvio = row_mercado.get('Desvio_Macro', 0)
     proporcao_volat = desvio / media if media > 0 else 0
     volat_disc = 1 if proporcao_volat > 0.10 else 0
     
+    # 3. Previsão do XGBoost Discreta (0=Queda, 1=Lateral, 2=Alta)
     xgb_disc = 0 if roi_pred < -4 else (2 if roi_pred > 6 else 1)
+    
+    # 4. Estação do Jogo (0 a 3)
     estacao_disc = int(row_mercado.get('Season_Num', 0))
+    
+    # 5. Origem da Custódia (1=Colheita, 2=Revenda)
     origem_disc = int(origem) 
 
+    # 6 e 7. Variáveis Dinâmicas do Portfólio (Lucro e Tempo)
     preco_atual = row_mercado.get('Price', 0)
     lucro_disc = 0
     tempo_disc = 0
     
-    if origem_disc == 2:  
+    if origem_disc == 2:  # Se for um item mantido para Revenda
+        # Cálculo do Lucro Atual Discreto (0=Prejuízo, 1=Lucro Médio, 2=Meta Batida)
         if preco_atual < custo_medio:
             lucro_disc = 0
         elif preco_atual < alvo_lucro:
@@ -182,6 +183,7 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
         else:
             lucro_disc = 2
             
+        # Cálculo do Tempo de Custódia buscando no DataFrame do TradeLog
         try:
             compras_item = df_trade[(df_trade['Nome do Item'] == item) & 
                                     (df_trade['Tipo'].str.contains("Compra", case=False))]
@@ -199,11 +201,11 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
                 if dt_compra:
                     dias_em_custodia = (obter_agora_brt() - dt_compra).days
                     if dias_em_custodia <= 3:
-                        tempo_disc = 1   
+                        tempo_disc = 1   # Ciclo Inicial
                     elif dias_em_custodia <= 8:
-                        tempo_disc = 2   
+                        tempo_disc = 2   # Ciclo Médio
                     else:
-                        tempo_disc = 3   
+                        tempo_disc = 3   # Alerta de Tempo Limite (>= 9 dias preso)
                 else:
                     tempo_disc = 1
             else:
@@ -226,6 +228,7 @@ credenciais = ServiceAccountCredentials.from_json_keyfile_name("credenciais_robo
 gc = gspread.authorize(credenciais)
 sh = gc.open(NOME_PLANILHA)
 
+# 1. Dados de Base
 inv_data = sh.worksheet("Inventario").get_all_values()
 inv_dict = {row[0]: limpar_numero(row[1]) for row in inv_data[1:]}
 
@@ -241,6 +244,7 @@ trade_data = sh.worksheet("TradeLog").get_all_values()
 df_trade = pd.DataFrame(trade_data[1:], columns=trade_data[0])
 compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Qtd'].apply(lambda x: sum(map(limpar_numero, x))).to_dict()
 
+# Carregamento inicial do histórico de preços brutos
 rec_data = sh.worksheet("RecLog").get_all_values()[1:]
 df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item', 'Price', 'Season'])
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
@@ -274,6 +278,9 @@ mapa_mult_desvio = {}
 mapa_veto = {}
 mapa_ajuste_roi = {}
 
+# ======================================================================
+# PERSISTÊNCIA DO CÉREBRO RL (CARREGAMENTO DO HISTÓRICO)
+# ======================================================================
 q_table = {}  
 alpha_rl = 0.2  
 
@@ -297,9 +304,11 @@ except Exception as e:
     except:
         print("⚠️ Aba Cerebro_RL já existente, mas vazia ou inacessível.")
 
+# Lista para capturar APENAS os índices que mudaram de estado NESTE ciclo específico
 indices_concluidos_neste_ciclo = []
 
 if not df_val.empty:
+    # Atualizar linhas pendentes usando Delta de Tempo Real em BRT
     for idx, row_val in df_val.iterrows():
         if row_val['Status'] == 'Aguardando' or row_val['Status'] == '':
             item_v = row_val['Item']
@@ -320,6 +329,7 @@ if not df_val.empty:
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
             status_v = "Aguardando"
             
+            # --- BLOCO DE VALIDAÇÃO COM FILTRO HÍBRIDO (PISO VS TETO) ---
             if tipo_v == "COMPRA":
                 if max_pos >= ref_fin_v:
                     status_v = "🏆 ACERTOU"  
@@ -332,6 +342,7 @@ if not df_val.empty:
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
+                        # CORREÇÃO CRÍTICA STOP LOSS: Se após o stop o preço continuou abaixo dele, o stop salvou capital!
                         if max_pos <= preco_sinal_v:
                             status_v = "🏆 ACERTOU (STOP PROTETIVO)"
                         else:
@@ -344,21 +355,26 @@ if not df_val.empty:
             df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  
             df_val.at[idx, 'Status'] = status_v
 
+            # Se o status foi finalizado AGORA, guardamos para atualizar o RL sem duplicidade
             if "🏆" in status_v or "❌" in status_v or "💰" in status_v:
                 indices_concluidos_neste_ciclo.append(idx)
 
+    # Força todas as colunas a voltarem a ser números nativos do Python antes do update
     df_val['ID_Sinal'] = pd.to_numeric(df_val['ID_Sinal'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
     df_val['Preco_Sinal'] = df_val['Preco_Sinal'].apply(limpar_numero)
     df_val['Referencia_Fin'] = df_val['Referencia_Fin'].apply(limpar_numero)
     df_val['Monitoramento_12d'] = df_val['Monitoramento_12d'].apply(limpar_numero)
     df_val['Dias_Passados'] = pd.to_numeric(df_val['Dias_Passados'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
     
+    # Isolamento limpo do Estado_RL
     df_val['Estado_RL'] = df_val['Estado_RL'].astype(str).apply(lambda x: x.strip().replace("'", ""))
     df_val['Estado_RL'] = df_val['Estado_RL'].apply(lambda x: f"'{x}" if x != "" else "")
 
+    # Salvar de volta as atualizações estruturadas
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1', value_input_option='USER_ENTERED')
     
+    # 1. Processamento das Estatísticas Tradicionais de Rigor
     df_concluidos = df_val[df_val['Status'].str.contains("🏆|❌|💰", na=False)].copy()
     if not df_concluidos.empty:
         def pontuar_status(r):
@@ -383,6 +399,9 @@ if not df_val.empty:
                 mapa_ajuste_roi[item_c] = -5.0
                 mapa_veto[item_c] = True
 
+        # ======================================================================
+        # MOTOR DE APRENDIZADO POR REFORÇO CORRIGIDO (APENAS SINAIS DO CICLO ATUAL)
+        # ======================================================================
         if indices_concluidos_neste_ciclo:
             df_reforco = df_val.loc[indices_concluidos_neste_ciclo].copy()
             df_reforco = df_reforco[df_reforco['Estado_RL'].astype(str).str.strip() != ""].copy()
@@ -392,6 +411,7 @@ if not df_val.empty:
                 acao_rl = row_r['Tipo']  
                 status_rl = row_r['Status']
 
+                # Mapeamento justo de recompensas incluindo a nova métrica de Stop Loss
                 if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
                     recompensa = 1.0
                 elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
@@ -417,81 +437,28 @@ novas_linhas_validacao = []
 # ==============================================================================
 cache_indicadores = {}
 ranking = []
-audit_linhas = []   
 X_cols = ['Price', 'Lag_1', 'RSI_Micro', 'Media_Macro', 'Desvio_Macro', 'Season_Num']
 
 for item in df_bruto['Item'].unique():
     try:
         d_it = preparar_indicadores(df_bruto, item)
         cache_indicadores[item] = d_it
-
-        d_treino = d_it[~d_it['is_holdout']].dropna(subset=['Preco_Futuro'] + X_cols)
-        d_teste  = d_it[ d_it['is_holdout'] ].dropna(subset=['Preco_Futuro'] + X_cols)
-
-        if len(d_treino) < 100:
-            continue
-
-        model = xgb.XGBRegressor(
-            n_estimators=40,
-            max_depth=3,
-            verbosity=0           
-        ).fit(
-            d_treino[X_cols],
-            d_treino['Preco_Futuro'],
-            sample_weight=d_treino['Peso_Temporal']
+        d_tr = d_it.dropna(subset=['Preco_Futuro'] + X_cols)
+        if len(d_tr) < 30: continue
+        
+        model = xgb.XGBRegressor(n_estimators=40, max_depth=3).fit(
+            d_tr[X_cols], d_tr['Preco_Futuro'], 
+            sample_weight=d_tr['Peso_Temporal']
         )
-
-        ultima_linha = d_it[X_cols].dropna().tail(1)
-        if ultima_linha.empty:
-            continue
-
-        pred = model.predict(ultima_linha)[0]
-        preco_atual = d_it.iloc[-1]['Price']
-        roi = ((pred - preco_atual) / preco_atual) * 100
+        
+        pred = model.predict(d_it[X_cols].tail(1))[0]
+        roi = ((pred - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
+        
         roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
+        ranking.append({'Item': item, 'ROI': roi, 'ROI_Ajustado': roi_ajustado})
+    except: continue
 
-        mae = rmse = acerto_direcao = None
-        n_treino = len(d_treino)
-        n_teste  = len(d_teste)
-
-        if n_teste >= 5:   
-            pred_teste = model.predict(d_teste[X_cols])
-            real_teste = d_teste['Preco_Futuro'].values
-
-            erros = pred_teste - real_teste
-            mae   = float(np.mean(np.abs(erros)))
-            rmse  = float(np.sqrt(np.mean(erros ** 2)))
-
-            preco_base_teste = d_teste['Price'].values
-            direcao_real  = (real_teste  > preco_base_teste).astype(int)
-            direcao_pred  = (pred_teste  > preco_base_teste).astype(int)
-            acerto_direcao = float(np.mean(direcao_real == direcao_pred) * 100)
-
-        ranking.append({
-            'Item':          item,
-            'ROI':           roi,
-            'ROI_Ajustado':  roi_ajustado
-        })
-
-        audit_linhas.append([
-            obter_agora_brt().strftime("%d/%m/%Y %H:%M"),
-            item,
-            round(mae,   4) if mae   is not None else "",
-            round(rmse,  4) if rmse  is not None else "",
-            round(acerto_direcao, 1) if acerto_direcao is not None else "",
-            n_treino,
-            n_teste,
-            round(roi, 2)
-        ])
-
-    except Exception as e:
-        print(f"⚠️ XGBoost falhou para '{item}': {e}")
-        continue
-
-df_ranking = (
-    pd.DataFrame(ranking).sort_values(by='ROI_Ajustado', ascending=False)
-    if ranking else pd.DataFrame(columns=['Item', 'ROI', 'ROI_Ajustado'])
-)
+df_ranking = pd.DataFrame(ranking).sort_values(by='ROI_Ajustado', ascending=False) if ranking else pd.DataFrame(columns=['Item', 'ROI', 'ROI_Ajustado'])
 
 # ==============================================================================
 # 3. GERAÇÃO DE SINAIS HIERÁRQUICOS
@@ -515,6 +482,7 @@ for item in df_ranking.head(30)['Item']:
     alvo_out_estatistico = row['Media_Macro'] + (m_desvio * row['Desvio_Macro'])
     
     if origem == 2 and custo_medio > 0:
+        # Correção matemática para embutir a taxa sobre o preço de venda final
         alvo_lucro = (custo_medio * (1 + LUCRO_REAL_DESEJADO)) / (1 - TAXA_MARKETPLACE)
         alvo_out = max(alvo_lucro, alvo_out_estatistico)
     else:
@@ -578,7 +546,7 @@ for item in df_ranking.head(30)['Item']:
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
                 
                 linha_sinais_hoje = len(lista_final) + 1
-                enviar_telegram(acao, item, preco_atual, Bond_sinal_hoje) # mantido original
+                enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
                 
                 ref_financeira = alvo_out if tipo_sinal == "COMPRA" else custo_medio
                 
@@ -605,10 +573,8 @@ if novas_linhas_validacao:
     print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
 
 # ==============================================================================
-# 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁREA E AUDITORIA
+# 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁREA
 # ==============================================================================
-
-# 4.1. Salvar os sinais diários em Sinais_Hoje (Recuperado do 4.9)
 try:
     ws_sinais = sh.worksheet("Sinais_Hoje")
     ws_sinais.clear()
@@ -618,36 +584,9 @@ try:
     set_frozen(ws_sinais, rows=1)
     
     format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje atualizada com Horário de Brasília (BRT)!")
+    print("✅ Planilha Sinais_Hoje updated com Horário de Brasília (BRT)!")
 except Exception as e:
     print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
-
-# 4.2. Salvar as métricas de treino/teste em XGB_Audit (Corrigido o NameError)
-try:
-    try:
-        ws_audit = sh.worksheet("XGB_Audit")
-    except Exception:
-        ws_audit = sh.add_worksheet(title="XGB_Audit", rows="5000", cols="8")
-        ws_audit.update(
-            values=[HEADERS_AUDIT],
-            range_name='A1',
-            value_input_option='USER_ENTERED'
-        )
-        set_frozen(ws_audit, rows=1)
-        format_cell_range(
-            ws_audit, 'A1:H1',
-            CellFormat(textFormat=TextFormat(bold=True))
-        )
-        print("📊 Aba XGB_Audit criada com sucesso.")
-
-    if audit_linhas:
-        ws_audit.append_rows(audit_linhas, value_input_option='USER_ENTERED')
-        print(f"📊 XGB_Audit: {len(audit_linhas)} itens registrados neste ciclo.")
-    else:
-        print("📊 XGB_Audit: nenhum item com dados suficientes para auditoria.")
-
-except Exception as e:
-    print(f"❌ Erro ao salvar XGB_Audit: {e}")
 
 # ==============================================================================
 # PERSISTÊNCIA DO CÉREBRO RL (GRAVAÇÃO E SINCRONIZAÇÃO DA Q-TABLE)
