@@ -144,8 +144,15 @@ def preparar_indicadores(df_original, nome_item):
     max_date = d['Timestamp'].max()
     d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
 
-    if len(d) > SHIFT_ALVO:
-        d.iloc[-SHIFT_ALVO:, d.columns.get_loc('is_holdout')] = True
+    # ==========================================================================
+    # CORREÇÃO DA JANELA DE TESTE (HOLDOUT)
+    # ==========================================================================
+    # O "ponto cego" real são as últimas SHIFT_ALVO linhas (onde o futuro é desconhecido).
+    # Portanto, nossa janela de validação deve ser o bloco IMEDIATAMENTE ANTERIOR a ele.
+    if len(d) > (2 * SHIFT_ALVO):
+        inicio_teste = len(d) - (2 * SHIFT_ALVO)
+        fim_teste = len(d) - SHIFT_ALVO
+        d.iloc[inicio_teste:fim_teste, d.columns.get_loc('is_holdout')] = True
 
     return d
 
