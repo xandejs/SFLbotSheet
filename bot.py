@@ -499,15 +499,18 @@ if not df_val.empty:
             status_v = "Aguardando"
             
             # --- BLOCO DE VALIDAÇÃO COM FILTRO HÍBRIDO (PISO VS TETO) ---
+            # Regra: o sinal só é concluído após dias_p >= 12.
+            # O Monitoramento_12d registra o preço máximo atingido durante o período
+            # a cada ciclo, mas a decisão final (acertou/falhou) espera os 12 dias.
             if tipo_v == "COMPRA":
-                if max_pos >= ref_fin_v:
-                    status_v = "🏆 ACERTOU"  
-                elif dias_p >= 12:
+                if dias_p >= 12:
                     piso_lucro_real = preco_sinal_v * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
-                    if max_pos >= piso_lucro_real:
+                    if max_pos >= ref_fin_v:
+                        status_v = "🏆 ACERTOU"
+                    elif max_pos >= piso_lucro_real:
                         status_v = "💰 LUCRO PARCIAL"
                     else:
-                        status_v = "❌ FALHOU"   
+                        status_v = "❌ FALHOU"
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
