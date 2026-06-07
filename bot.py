@@ -504,17 +504,28 @@ if not df_val.empty:
             df_pos_sinal = d_hist[d_hist['Timestamp'] >= data_sinal_v]
             
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
+
+            # Contador de horas com preço sustentado no alvo.
+            # Cada linha do RecLog = 1 registro horário.
+            # Usado para distinguir spike fugaz de sustentação real operável.
+            horas_no_alvo = int((df_pos_sinal['Price'] >= ref_fin_v).sum()) if not df_pos_sinal.empty else 0
+
             status_v = "Aguardando"
-            
-            # --- BLOCO DE VALIDAÇÃO COM FILTRO HÍBRIDO (PISO VS TETO) ---
+
+            # --- BLOCO DE VALIDAÇÃO COM SUSTENTAÇÃO DE PREÇO ---
             # Regra: o sinal só é concluído após dias_p >= 12.
-            # O Monitoramento_12d registra o preço máximo atingido durante o período
-            # a cada ciclo, mas a decisão final (acertou/falhou) espera os 12 dias.
+            # max_pos → apenas para registro no Monitoramento_12d (painel visual).
+            # horas_no_alvo → critério real de aprendizado do Cérebro RL:
+            #   >= 3h no alvo → mercado sustentou → oportunidade real de execução manual
+            #   == 1-2h no alvo → atingiu mas fugaz → lucro parcial (spike que escapou)
+            #   0h no alvo → não atingiu → falhou
             if tipo_v == "COMPRA":
                 if dias_p >= 12:
                     piso_lucro_real = preco_sinal_v * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
-                    if max_pos >= ref_fin_v:
+                    if horas_no_alvo >= 3:
                         status_v = "🏆 ACERTOU"
+                    elif horas_no_alvo >= 1:
+                        status_v = "💰 LUCRO PARCIAL"
                     elif max_pos >= piso_lucro_real:
                         status_v = "💰 LUCRO PARCIAL"
                     else:
