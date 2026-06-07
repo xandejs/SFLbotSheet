@@ -170,10 +170,18 @@ def preparar_indicadores(df_original, nome_item):
     )
 
     # --- HOLDOUT TEMPORAL ---
-    # Os últimos SHIFT_ALVO registros são reservados para teste.
-    # O modelo NUNCA os vê durante o treino — sem data leakage.
-    if len(d) > SHIFT_ALVO:
-        d.iloc[-SHIFT_ALVO:, d.columns.get_loc('is_holdout')] = True
+    # Separamos dois conceitos que antes eram confundidos:
+    #   SHIFT_ALVO (288) = janela de predição de produção → gera NaN nas últimas 288 linhas
+    #   HOLDOUT_AUDIT (72) = janela de medição de erro → colocada ANTES da zona de NaN
+    #
+    # Layout: [Treino][Holdout=72][NaN=288]
+    # Mínimo por item: 120 (warmup) + 50 (treino) + 72 (holdout) + 288 (NaN) = 530 linhas (~22 dias)
+    # Itens com menos de 530 linhas: treinados normalmente, MAE fica em branco (aceitável).
+    HOLDOUT_AUDIT = 72   # 3 dias — suficiente para MAE/RMSE/Acerto_Direcao confiáveis
+    holdout_fim = len(d) - SHIFT_ALVO
+    holdout_ini = holdout_fim - HOLDOUT_AUDIT
+    if holdout_ini > 0:
+        d.iloc[holdout_ini:holdout_fim, d.columns.get_loc('is_holdout')] = True
 
     return d
 
@@ -680,7 +688,7 @@ df_ranking = (
 # ==============================================================================
 lista_final = []
 
-for item in df_ranking.head(30)['Item']:
+for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitrário
     d_it = cache_indicadores.get(item)
     row = d_it.iloc[-1]
     roi_pred = df_ranking[df_ranking['Item'] == item]['ROI'].values[0]
