@@ -26,6 +26,13 @@ TOLERANCIA_SUJEIRA = 0.15
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 
+# Cabeçalhos da aba de auditoria do XGBoost — definido aqui para estar
+# disponível tanto na criação da aba quanto em referências posteriores.
+HEADERS_AUDIT = [
+    "Timestamp", "Item", "MAE", "RMSE",
+    "Acerto_Direcao_%", "N_Treino", "N_Teste", "ROI_Previsto_%"
+]
+
 # ==============================================================================
 # FUNÇÕES DE APOIO E INTELIGÊNCIA
 # ==============================================================================
@@ -98,8 +105,9 @@ def calcular_fifo_hibrido(sh, inventario_dict):
             for _, row in compras_item.iterrows():
                 falta = saldo_real - qtd_acumulada
                 if falta <= 0: break
+                if row['Qtd'] <= 0: continue          # guarda antes de qualquer divisão
                 usar = min(row['Qtd'], falta)
-                custo_total += (usar * (row['SFL_Total'] / row['Qtd'] if row['Qtd'] > 0 else 0))
+                custo_total   += usar * (row['SFL_Total'] / row['Qtd'])
                 qtd_acumulada += usar
             fifo_map[item] = custo_total / qtd_acumulada if qtd_acumulada > 0 else 0.0
         return fifo_map
@@ -107,42 +115,66 @@ def calcular_fifo_hibrido(sh, inventario_dict):
         print(f"Erro FIFO: {e}"); return {}
 
 def preparar_indicadores(df_original, nome_item):
+    """
+    Prepara os indicadores técnicos e divide os dados em treino/teste
+    respeitando a ordem temporal (sem data leakage).
+
+    Retorna o DataFrame completo com as colunas adicionais:
+      - is_holdout: True para as últimas SHIFT_ALVO linhas (conjunto de teste)
+    """
     d = df_original[df_original['Item'] == nome_item].copy()
     d['Timestamp'] = pd.to_datetime(d['Timestamp'], dayfirst=True, errors='coerce')
     d = d.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
-    
-    # ADIÇÃO DEFENSIVA: Força a criação das colunas do modelo populadas com NaN.
-    # Se o histórico for curto e o 'return d' antecipado disparar, evita KeyError na IA externa.
-    for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro', 'Season_Num', 'Lag_1', 'Preco_Futuro', 'Peso_Temporal']:
+
+    # Garante que as colunas do modelo existem mesmo se o histórico for curto
+    for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro',
+                'Season_Num', 'Lag_1', 'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
         d[col] = np.nan
-        
-    # Define o tamanho das janelas dinamicamente com base na frequência diária
-    janela_macro_dinamica = 30 * REGISTROS_POR_DIA  
-    janela_micro_dinamica = 10 * REGISTROS_POR_DIA  
-    
-    if len(d) < janela_micro_dinamica: return d
+    d['is_holdout'] = False
 
-   # --- JANELA MACRO (30 dias dinâmicos) para Alvos ---
-    # Alterado min_periods para 120 (Exige pelo menos 5 dias cheios de dados na frequência de 24 registros/dia)
-    d['Media_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=120).mean()
-    d['Desvio_Macro'] = d['Price'].rolling(window=janela_macro_dinamica, min_periods=120).std()
+    janela_macro_dinamica = 30 * REGISTROS_POR_DIA   # 720 registros
+    janela_micro_dinamica = 10 * REGISTROS_POR_DIA   # 240 registros
 
-    # --- JANELA MICRO (10 dias dinâmicos) para Momentum ---
-    # Alterado min_periods para 48 (Exige pelo menos 2 dias cheios de dados na frequência de 24 registros/dia)
+    if len(d) < janela_micro_dinamica:
+        return d
+
+    # --- JANELA MACRO (30 dias) ---
+    # min_periods=240 exige 10 dias completos antes de calcular a banda.
+    # Antes era 120 (5 dias), o que gerava bandas muito ruidosas no início.
+    d['Media_Macro'] = d['Price'].rolling(
+        window=janela_macro_dinamica, min_periods=240
+    ).mean()
+    d['Desvio_Macro'] = d['Price'].rolling(
+        window=janela_macro_dinamica, min_periods=240
+    ).std()
+
+    # --- JANELA MICRO (10 dias) para RSI ---
     delta = d['Price'].diff()
     ganho = delta.clip(lower=0).rolling(window=janela_micro_dinamica, min_periods=48).mean()
     perda = -1 * delta.clip(upper=0).rolling(window=janela_micro_dinamica, min_periods=48).mean()
-    d['RSI_Micro'] = (100 - (100 / (1 + (ganho / perda.replace(0, 0.0001))))).fillna(50)
 
-    # Dados para IA
+    # Quando perda == 0 (mercado só subiu), RSI real é 100, não 50.
+    # Marcamos explicitamente em vez de mascarar com fillna(50).
+    rsi_raw = 100 - (100 / (1 + (ganho / perda.replace(0, np.nan))))
+    d['RSI_Micro'] = rsi_raw.fillna(100)   # sem dados de perda = mercado em alta total = RSI 100
+
+    # --- Features para o XGBoost ---
     d['Season_Num'] = d['Season'].map(MAP_ESTACOES).fillna(0)
-    d['Lag_1'] = d['Price'].shift(1)
-    d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
-    
-    # Peso Temporal (Dados recentes valem mais para o XGBoost)
+    d['Lag_1']       = d['Price'].shift(1)
+    d['Preco_Futuro']= d['Price'].shift(-SHIFT_ALVO)
+
+    # Peso temporal exponencial (dados mais recentes pesam mais)
     max_date = d['Timestamp'].max()
-    d['Peso_Temporal'] = d['Timestamp'].apply(lambda x: np.exp(-0.01 * (max_date - x).days))
-    
+    d['Peso_Temporal'] = d['Timestamp'].apply(
+        lambda x: np.exp(-0.01 * (max_date - x).days)
+    )
+
+    # --- HOLDOUT TEMPORAL ---
+    # Os últimos SHIFT_ALVO registros são reservados para teste.
+    # O modelo NUNCA os vê durante o treino — sem data leakage.
+    if len(d) > SHIFT_ALVO:
+        d.iloc[-SHIFT_ALVO:, d.columns.get_loc('is_holdout')] = True
+
     return d
 
 def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_lucro, df_trade, roi_pred):
@@ -218,6 +250,143 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
 
     return f"{rsi_disc}{volat_disc}{xgb_disc}{estacao_disc}{origem_disc}{lucro_disc}{tempo_disc}"
 
+def pontuar_status(r):
+    """Converte o Status de um sinal concluído em pontuação para calibração.
+    Separado como função de módulo para evitar redefinição dentro de blocos condicionais."""
+    st = r['Status']
+    if "🏆 ACERTOU" in st: return 1.0
+    if "💰 LUCRO"   in st: return 0.5
+    return 0.0
+
+def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None):
+    """
+    Constrói os três mapas de calibração combinando duas fontes de verdade:
+
+    FONTE PRIMÁRIA — taxa de acerto real (Validacao_Sinais):
+        Lê do df_val_mem já carregado em memória (sem chamada extra à API).
+        Calibra mult_desvio, veto e ajuste de ROI com base no histórico real.
+        Latência de 12 dias — itens novos ficam sem dados desta fonte.
+
+    FONTE SECUNDÁRIA — MAE do XGBoost (XGB_Audit):
+        Para itens sem sinais concluídos, usa o erro do modelo como proxy.
+        Resposta imediata, mas menos confiável que o resultado de mercado.
+        Se XGB_Audit não existir ainda, ignora silenciosamente.
+
+    Retorna: (mapa_mult_desvio, mapa_veto, mapa_ajuste_roi)
+    """
+    mapa_mult = {}
+    mapa_veto = {}
+    mapa_roi  = {}
+    _confianca = {}   # metadado interno: 0.0 (só proxy) a 1.0 (só histórico real)
+
+    # ------------------------------------------------------------------
+    # FONTE 1: Taxa de acerto real — usa df_val já em memória
+    # ------------------------------------------------------------------
+    if df_val_mem is not None and not df_val_mem.empty:
+        df_concluidos = df_val_mem[
+            df_val_mem['Status'].str.contains("🏆|❌|💰", na=False)
+        ].copy()
+
+        if not df_concluidos.empty:
+            df_concluidos['Pontos'] = df_concluidos.apply(pontuar_status, axis=1)
+
+            for item_c, group in df_concluidos.groupby('Item'):
+                n    = len(group)
+                taxa = (group['Pontos'].sum() / n) * 100
+                confianca = min(1.0, n / 10.0)   # plena confiança com 10+ sinais
+
+                if taxa >= 70:
+                    mapa_mult[item_c] = 2.0
+                    mapa_roi[item_c]  = 0.0
+                    mapa_veto[item_c] = False
+                elif taxa >= 45:
+                    mapa_mult[item_c] = 2.4
+                    mapa_roi[item_c]  = -5.0
+                    mapa_veto[item_c] = False
+                else:
+                    mapa_mult[item_c] = 2.4
+                    mapa_roi[item_c]  = -5.0
+                    mapa_veto[item_c] = True
+
+                _confianca[item_c] = confianca
+
+            n_itens = df_concluidos['Item'].nunique()
+            print(f"📊 Calibração por sinais reais: {n_itens} itens | "
+                  f"{len(df_concluidos)} sinais concluídos.")
+        else:
+            print("ℹ️  Calibração: nenhum sinal concluído ainda — fase bootstrap.")
+    else:
+        print("ℹ️  Calibração: Validacao_Sinais vazia — fase bootstrap.")
+
+    # ------------------------------------------------------------------
+    # FONTE 2: MAE do XGBoost — lê XGB_Audit para enriquecer itens sem
+    # histórico de sinais concluídos ainda (proxy de curto prazo)
+    # ------------------------------------------------------------------
+    JANELA_AUDIT = 72   # últimas 72 horas de ciclos
+
+    try:
+        ws_audit   = sh.worksheet("XGB_Audit")
+        audit_data = ws_audit.get_all_values()
+
+        if len(audit_data) > 1:
+            df_audit = pd.DataFrame(audit_data[1:], columns=audit_data[0])
+            df_audit['MAE']              = df_audit['MAE'].apply(limpar_numero)
+            df_audit['Acerto_Direcao_%'] = df_audit['Acerto_Direcao_%'].apply(limpar_numero)
+            df_audit = df_audit[df_audit['MAE'] > 0].copy()
+
+            n_proxy = 0
+            for item_a, grupo in df_audit.groupby('Item'):
+                ultimos      = grupo.tail(JANELA_AUDIT)
+                mae_medio    = ultimos['MAE'].mean()
+                acerto_medio = ultimos['Acerto_Direcao_%'].mean()
+
+                preco_medio  = df_bruto_local[df_bruto_local['Item'] == item_a]['Price'].tail(240).mean()
+                mae_relativo = (mae_medio / preco_medio) if preco_medio > 0 else 0.15
+
+                if item_a not in mapa_mult:
+                    # Sem histórico real → MAE como único sinal de confiança
+                    if mae_relativo < 0.05 and acerto_medio >= 60:
+                        mapa_mult[item_a] = 2.0
+                        mapa_roi[item_a]  = 0.0
+                        mapa_veto[item_a] = False
+                    elif mae_relativo < 0.12:
+                        mapa_mult[item_a] = 2.4
+                        mapa_roi[item_a]  = -3.0
+                        mapa_veto[item_a] = False
+                    else:
+                        # Modelo impreciso → bands largas, sem veto (sem evidência real ainda)
+                        mapa_mult[item_a] = 2.8
+                        mapa_roi[item_a]  = -6.0
+                        mapa_veto[item_a] = False
+                    _confianca[item_a] = 0.0
+                    n_proxy += 1
+                else:
+                    # Tem histórico real parcial → ajuste leve proporcional à incerteza
+                    peso_xgb = 1.0 - _confianca.get(item_a, 1.0)
+                    if mae_relativo > 0.12 and peso_xgb > 0:
+                        mult_atual = mapa_mult[item_a]
+                        mapa_mult[item_a] = round(min(mult_atual + 0.3 * peso_xgb, 3.0), 2)
+
+            print(f"📐 Calibração por XGB_Audit: {n_proxy} itens via proxy MAE.")
+
+    except gspread.exceptions.WorksheetNotFound:
+        print("ℹ️  XGB_Audit ainda não existe — será criada neste ciclo.")
+    except Exception as e:
+        print(f"ℹ️  XGB_Audit inacessível: {e} — calibração por sinais reais apenas.")
+
+    # ------------------------------------------------------------------
+    # INDICADOR DE BOOTSTRAP
+    # ------------------------------------------------------------------
+    n_estados = len(q_table)
+    if n_estados < 10:
+        print(f"🌱 BOOTSTRAP ATIVO: Cerebro_RL com {n_estados} estados. "
+              f"Decisões por estatística pura.")
+    else:
+        print(f"🧠 Cerebro_RL operacional: {n_estados} estados memorizados.")
+
+    print(f"✅ Calibração final: {len(mapa_mult)} itens com parâmetros ajustados.")
+    return mapa_mult, mapa_veto, mapa_roi
+
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL
 # ==============================================================================
@@ -274,9 +443,9 @@ if len(val_data) > 0 and "Estado_RL" not in val_data[0]:
 else:
     df_val = pd.DataFrame(val_data[1:], columns=val_data[0]) if len(val_data) > 1 else pd.DataFrame(columns=headers_val)
 
-mapa_mult_desvio = {}
-mapa_veto = {}
-mapa_ajuste_roi = {}
+mapa_mult_desvio = {}   # populados por construir_calibracao_hibrida() após validação
+mapa_veto        = {}
+mapa_ajuste_roi  = {}
 
 # ======================================================================
 # PERSISTÊNCIA DO CÉREBRO RL (CARREGAMENTO DO HISTÓRICO)
@@ -373,92 +542,133 @@ if not df_val.empty:
     # Salvar de volta as atualizações estruturadas
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1', value_input_option='USER_ENTERED')
-    
-    # 1. Processamento das Estatísticas Tradicionais de Rigor
-    df_concluidos = df_val[df_val['Status'].str.contains("🏆|❌|💰", na=False)].copy()
-    if not df_concluidos.empty:
-        def pontuar_status(r):
-            st = r['Status']
-            if "🏆 ACERTOU" in st: return 1.0
-            if "💰 LUCRO" in st: return 0.5
-            return 0.0
-            
-        df_concluidos['Pontos'] = df_concluidos.apply(pontuar_status, axis=1)
-        for item_c, group in df_concluidos.groupby('Item'):
-            taxa = (group['Pontos'].sum() / len(group)) * 100
-            if taxa >= 70:
-                mapa_mult_desvio[item_c] = 2.0
-                mapa_ajuste_roi[item_c] = 0.0
-                mapa_veto[item_c] = False
-            elif taxa >= 45:
-                mapa_mult_desvio[item_c] = 2.4
-                mapa_ajuste_roi[item_c] = -5.0
-                mapa_veto[item_c] = False
+
+    # ======================================================================
+    # MOTOR DE APRENDIZADO POR REFORÇO — apenas sinais novos deste ciclo
+    # (calibração dos mapas movida para construir_calibracao_hibrida abaixo)
+    # ======================================================================
+    if indices_concluidos_neste_ciclo:
+        df_reforco = df_val.loc[indices_concluidos_neste_ciclo].copy()
+        df_reforco = df_reforco[df_reforco['Estado_RL'].astype(str).str.strip() != ""].copy()
+
+        for _, row_r in df_reforco.iterrows():
+            st_rl     = str(row_r['Estado_RL']).strip().replace("'", "")
+            acao_rl   = row_r['Tipo']
+            status_rl = row_r['Status']
+
+            if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
+                recompensa = 1.0
+            elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
+                recompensa = 0.5
             else:
-                mapa_mult_desvio[item_c] = 2.4
-                mapa_ajuste_roi[item_c] = -5.0
-                mapa_veto[item_c] = True
+                recompensa = -1.0
 
-        # ======================================================================
-        # MOTOR DE APRENDIZADO POR REFORÇO CORRIGIDO (APENAS SINAIS DO CICLO ATUAL)
-        # ======================================================================
-        if indices_concluidos_neste_ciclo:
-            df_reforco = df_val.loc[indices_concluidos_neste_ciclo].copy()
-            df_reforco = df_reforco[df_reforco['Estado_RL'].astype(str).str.strip() != ""].copy()
-            
-            for _, row_r in df_reforco.iterrows():
-                st_rl = str(row_r['Estado_RL']).strip().replace("'", "")
-                acao_rl = row_r['Tipo']  
-                status_rl = row_r['Status']
+            if st_rl not in q_table:
+                q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0}
 
-                # Mapeamento justo de recompensas incluindo a nova métrica de Stop Loss
-                if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
-                    recompensa = 1.0
-                elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
-                    recompensa = 0.5
-                else:
-                    recompensa = -1.0  
+            q_atual = q_table[st_rl].get(acao_rl, 0.0)
+            q_table[st_rl][acao_rl] = q_atual + alpha_rl * (recompensa - q_atual)
 
-                if st_rl not in q_table:
-                    q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0}
+        print(f"🧠 Cérebro RL Atualizado de forma incremental: {len(df_reforco)} novos estados processados.")
 
-                q_atual = q_table[st_rl].get(acao_rl, 0.0)
-                q_table[st_rl][acao_rl] = q_atual + alpha_rl * (recompensa - q_atual)
-                
-            print(f"🧠 Cérebro RL Atualizado de forma incremental: {len(df_reforco)} novos estados processados.")
-            
-        print(f"🧠 Cérebro RL Atualizado internamente: {len(q_table)} estados de mercado na memória RAM.")
+    print(f"🧠 Cérebro RL Atualizado internamente: {len(q_table)} estados de mercado na memória RAM.")
 
 prox_id_sinal = len(df_val) + 1
 novas_linhas_validacao = []
+
+# Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
+# + proxy de MAE do XGBoost (XGB_Audit do ciclo anterior).
+# Chamada aqui, após a q_table estar atualizada e df_val pronto em memória.
+mapa_mult_desvio, mapa_veto, mapa_ajuste_roi = construir_calibracao_hibrida(sh, df_bruto, df_val_mem=df_val)
 
 # ==============================================================================
 # 2. IA E TREINAMENTO
 # ==============================================================================
 cache_indicadores = {}
 ranking = []
+audit_linhas = []   # acumula métricas para gravar na aba XGB_Audit ao final
 X_cols = ['Price', 'Lag_1', 'RSI_Micro', 'Media_Macro', 'Desvio_Macro', 'Season_Num']
 
 for item in df_bruto['Item'].unique():
     try:
         d_it = preparar_indicadores(df_bruto, item)
         cache_indicadores[item] = d_it
-        d_tr = d_it.dropna(subset=['Preco_Futuro'] + X_cols)
-        if len(d_tr) < 30: continue
-        
-        model = xgb.XGBRegressor(n_estimators=40, max_depth=3).fit(
-            d_tr[X_cols], d_tr['Preco_Futuro'], 
-            sample_weight=d_tr['Peso_Temporal']
-        )
-        
-        pred = model.predict(d_it[X_cols].tail(1))[0]
-        roi = ((pred - d_it.iloc[-1]['Price']) / d_it.iloc[-1]['Price']) * 100
-        
-        roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
-        ranking.append({'Item': item, 'ROI': roi, 'ROI_Ajustado': roi_ajustado})
-    except: continue
 
-df_ranking = pd.DataFrame(ranking).sort_values(by='ROI_Ajustado', ascending=False) if ranking else pd.DataFrame(columns=['Item', 'ROI', 'ROI_Ajustado'])
+        # Separação temporal: treino = sem holdout, teste = holdout
+        d_treino = d_it[~d_it['is_holdout']].dropna(subset=['Preco_Futuro'] + X_cols)
+        d_teste  = d_it[ d_it['is_holdout'] ].dropna(subset=['Preco_Futuro'] + X_cols)
+
+        # Mínimo de amostras para treino ser confiável (antes era apenas 30)
+        if len(d_treino) < 100:
+            continue
+
+        # --- TREINO ---
+        model = xgb.XGBRegressor(
+            n_estimators=40,
+            max_depth=3,
+            verbosity=0           # sem output no console
+        ).fit(
+            d_treino[X_cols],
+            d_treino['Preco_Futuro'],
+            sample_weight=d_treino['Peso_Temporal']
+        )
+
+        # --- PREDIÇÃO DE PRODUÇÃO (última linha disponível) ---
+        ultima_linha = d_it[X_cols].dropna().tail(1)
+        if ultima_linha.empty:
+            continue
+
+        pred = model.predict(ultima_linha)[0]
+        preco_atual = d_it.iloc[-1]['Price']
+        roi = ((pred - preco_atual) / preco_atual) * 100
+        roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
+
+        # --- MÉTRICAS NO HOLDOUT (aprendizado real) ---
+        mae = rmse = acerto_direcao = None
+        n_treino = len(d_treino)
+        n_teste  = len(d_teste)
+
+        if n_teste >= 5:   # só calcula se houver dados suficientes no holdout
+            pred_teste = model.predict(d_teste[X_cols])
+            real_teste = d_teste['Preco_Futuro'].values
+
+            erros = pred_teste - real_teste
+            mae   = float(np.mean(np.abs(erros)))
+            rmse  = float(np.sqrt(np.mean(erros ** 2)))
+
+            # Acerto de direção: o modelo previu subida/queda corretamente?
+            preco_base_teste = d_teste['Price'].values
+            direcao_real  = (real_teste  > preco_base_teste).astype(int)
+            direcao_pred  = (pred_teste  > preco_base_teste).astype(int)
+            acerto_direcao = float(np.mean(direcao_real == direcao_pred) * 100)
+
+        ranking.append({
+            'Item':          item,
+            'ROI':           roi,
+            'ROI_Ajustado':  roi_ajustado
+        })
+
+        # Acumula linha de auditoria para gravar depois
+        audit_linhas.append([
+            obter_agora_brt().strftime("%d/%m/%Y %H:%M"),
+            item,
+            round(mae,   4) if mae   is not None else "",
+            round(rmse,  4) if rmse  is not None else "",
+            round(acerto_direcao, 1) if acerto_direcao is not None else "",
+            n_treino,
+            n_teste,
+            round(roi, 2)
+        ])
+
+    except Exception as e:
+        print(f"⚠️ XGBoost falhou para '{item}': {e}")
+        continue
+
+df_ranking = (
+    pd.DataFrame(ranking).sort_values(by='ROI_Ajustado', ascending=False)
+    if ranking else pd.DataFrame(columns=['Item', 'ROI', 'ROI_Ajustado'])
+)
+
 
 # ==============================================================================
 # 3. GERAÇÃO DE SINAIS HIERÁRQUICOS
@@ -576,17 +786,30 @@ if novas_linhas_validacao:
 # 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁREA
 # ==============================================================================
 try:
-    ws_sinais = sh.worksheet("Sinais_Hoje")
-    ws_sinais.clear()
-    
-    cabecalho = [["Item", "ROI Prev %", "Decisão", "Entrada Sniper", "Saída Alvo", "Origem", "Estação", "Estado_RL", "Atualização"]]
-    ws_sinais.update(values=(cabecalho + lista_final), range_name='A1', value_input_option='USER_ENTERED')
-    set_frozen(ws_sinais, rows=1)
-    
-    format_cell_range(ws_sinais, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Planilha Sinais_Hoje updated com Horário de Brasília (BRT)!")
+    try:
+        ws_audit = sh.worksheet("XGB_Audit")
+    except Exception:
+        ws_audit = sh.add_worksheet(title="XGB_Audit", rows="5000", cols="8")
+        ws_audit.update(
+            values=[HEADERS_AUDIT],
+            range_name='A1',
+            value_input_option='USER_ENTERED'
+        )
+        set_frozen(ws_audit, rows=1)
+        format_cell_range(
+            ws_audit, 'A1:H1',
+            CellFormat(textFormat=TextFormat(bold=True))
+        )
+        print("📊 Aba XGB_Audit criada com sucesso.")
+
+    if audit_linhas:
+        ws_audit.append_rows(audit_linhas, value_input_option='USER_ENTERED')
+        print(f"📊 XGB_Audit: {len(audit_linhas)} itens registrados neste ciclo.")
+    else:
+        print("📊 XGB_Audit: nenhum item com dados suficientes para auditoria.")
+
 except Exception as e:
-    print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
+    print(f"❌ Erro ao salvar XGB_Audit: {e}")
 
 # ==============================================================================
 # PERSISTÊNCIA DO CÉREBRO RL (GRAVAÇÃO E SINCRONIZAÇÃO DA Q-TABLE)
