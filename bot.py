@@ -142,10 +142,10 @@ def preparar_indicadores(df_original, nome_item):
     # min_periods=240 exige 10 dias completos antes de calcular a banda.
     # Antes era 120 (5 dias), o que gerava bandas muito ruidosas no início.
     d['Media_Macro'] = d['Price'].rolling(
-        window=janela_macro_dinamica, min_periods=240
+        window=janela_macro_dinamica, min_periods=120
     ).mean()
     d['Desvio_Macro'] = d['Price'].rolling(
-        window=janela_macro_dinamica, min_periods=240
+        window=janela_macro_dinamica, min_periods=120
     ).std()
 
     # --- JANELA MICRO (10 dias) para RSI ---
@@ -598,8 +598,10 @@ for item in df_bruto['Item'].unique():
         d_treino = d_it[~d_it['is_holdout']].dropna(subset=['Preco_Futuro'] + X_cols)
         d_teste  = d_it[ d_it['is_holdout'] ].dropna(subset=['Preco_Futuro'] + X_cols)
 
-        # Mínimo de amostras para treino ser confiável (antes era apenas 30)
-        if len(d_treino) < 100:
+        # Mínimo de 50 amostras de treino — exigir 100 bloqueava itens com menos de
+        # 26 dias de histórico (100 + 288 NaN + 240 warmup = 628 linhas por item).
+        # Com 50 + 288 + 120 = 458 linhas (~19 dias), a maioria dos itens ativos qualifica.
+        if len(d_treino) < 50:
             continue
 
         # --- TREINO ---
@@ -783,7 +785,36 @@ if novas_linhas_validacao:
     print(f"📌 {len(novas_linhas_validacao)} novos sinais foram integrados para monitorização.")
 
 # ==============================================================================
-# 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁREA
+# 4. SALVAMENTO DA PLANILHA DE SELEÇÃO DIÁRIA (Sinais_Hoje)
+# ==============================================================================
+HEADERS_HOJE = [
+    "Item", "ROI_Prev_%", "Ação",
+    "Alvo_Entrada", "Alvo_Saída",
+    "Origem", "Estação", "Estado_RL", "Atualizado"
+]
+
+try:
+    try:
+        ws_hoje = sh.worksheet("Sinais_Hoje")
+    except Exception:
+        ws_hoje = sh.add_worksheet(title="Sinais_Hoje", rows="200", cols="9")
+        set_frozen(ws_hoje, rows=1)
+        format_cell_range(ws_hoje, 'A1:I1', CellFormat(textFormat=TextFormat(bold=True)))
+        print("📋 Aba Sinais_Hoje criada com sucesso.")
+
+    ws_hoje.clear()
+    ws_hoje.update(
+        values=([HEADERS_HOJE] + lista_final),
+        range_name='A1',
+        value_input_option='USER_ENTERED'
+    )
+    print(f"📋 Sinais_Hoje: {len(lista_final)} itens gravados.")
+
+except Exception as e:
+    print(f"❌ Erro ao salvar Sinais_Hoje: {e}")
+
+# ==============================================================================
+# 4b. GRAVAÇÃO DA AUDITORIA DO XGBOOST (XGB_Audit)
 # ==============================================================================
 try:
     try:
