@@ -504,40 +504,17 @@ if not df_val.empty:
             df_pos_sinal = d_hist[d_hist['Timestamp'] >= data_sinal_v]
             
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
-
-            # horas_no_alvo  → COMPRA: horas com Price >= ref_fin_v (alvo de compra)
-            # horas_venda     → VENDA:  horas com Price >= preco_sinal_v (nível de venda sinalizado)
-            # Ambos medem se o mercado sustentou a oportunidade tempo suficiente
-            # para execução manual — distinguem spike fugaz de janela real.
-            horas_no_alvo = int((df_pos_sinal['Price'] >= ref_fin_v).sum())    if not df_pos_sinal.empty else 0
-            horas_venda   = int((df_pos_sinal['Price'] >= preco_sinal_v).sum()) if not df_pos_sinal.empty else 0
-
             status_v = "Aguardando"
-
-            # --- BLOCO DE VALIDAÇÃO COM SUSTENTAÇÃO DE PREÇO ---
-            # Regra geral: sinal só conclui após dias_p >= 12.
-            # max_pos → registro visual no Monitoramento_12d (painel), não decide status.
-            #
-            # COMPRA:
-            #   horas_no_alvo >= 3 → 🏆 ACERTOU        (sustentou ≥3h no alvo)
-            #   horas_no_alvo >= 1 → 💰 LUCRO PARCIAL  (atingiu mas fugaz)
-            #   max_pos >= piso    → 💰 LUCRO PARCIAL  (não bateu alvo mas cobriu custo)
-            #   caso contrário     → ❌ FALHOU
-            #
-            # VENDA (não-STOP):
-            #   horas_venda >= 3   → 🏆 ACERTOU (TOPO)       (sustentou ≥3h no nível de venda)
-            #   horas_venda >= 1   → 💰 LUCRO PARCIAL (SPIKE) (preço passou mas fugiu rápido)
-            #   horas_venda == 0   → ❌ FALHOU                 (preço caiu antes de qualquer execução)
-            #
-            # STOP LOSS:
-            #   Mantém lógica própria — avalia se o stop protegeu capital após 12 dias.
+            
+            # --- BLOCO DE VALIDAÇÃO COM FILTRO HÍBRIDO (PISO VS TETO) ---
+            # Regra: o sinal só é concluído após dias_p >= 12.
+            # O Monitoramento_12d registra o preço máximo atingido durante o período
+            # a cada ciclo, mas a decisão final (acertou/falhou) espera os 12 dias.
             if tipo_v == "COMPRA":
                 if dias_p >= 12:
                     piso_lucro_real = preco_sinal_v * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
-                    if horas_no_alvo >= 3:
+                    if max_pos >= ref_fin_v:
                         status_v = "🏆 ACERTOU"
-                    elif horas_no_alvo >= 1:
-                        status_v = "💰 LUCRO PARCIAL"
                     elif max_pos >= piso_lucro_real:
                         status_v = "💰 LUCRO PARCIAL"
                     else:
@@ -545,18 +522,14 @@ if not df_val.empty:
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
+                        # CORREÇÃO CRÍTICA STOP LOSS: Se após o stop o preço continuou abaixo dele, o stop salvou capital!
                         if max_pos <= preco_sinal_v:
                             status_v = "🏆 ACERTOU (STOP PROTETIVO)"
                         else:
                             status_v = "❌ FALHOU (STOP PREMATURO)"
                 else:
                     if dias_p >= 12:
-                        if horas_venda >= 3:
-                            status_v = "🏆 ACERTOU (TOPO)"
-                        elif horas_venda >= 1:
-                            status_v = "💰 LUCRO PARCIAL (SPIKE)"
-                        else:
-                            status_v = "❌ FALHOU"
+                        status_v = "💰 LUCRO (SUBIU)" if max_pos > preco_sinal_v else "🏆 ACERTOU (TOPO)"
             
             df_val.at[idx, 'Dias_Passados'] = int(dias_p)  
             df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  
