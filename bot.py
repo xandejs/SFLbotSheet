@@ -789,20 +789,23 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
 
     if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
         dt_hoje_str = obter_agora_brt().strftime("%d%m%Y")
-        tipo_sinal = "COMPRA" if "COMPRAR" in acao else "VENDA"
-        chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}"
-        
+        tipo_sinal  = "COMPRA" if "COMPRAR" in acao else "VENDA"
+
+        # _STOP é definido ANTES da chave para que a verificação de duplicata
+        # use a string final idêntica à gravada no df_val. Sem isso, a checagem
+        # compara "Stone_VENDA_07062026" com "Stone_VENDA_07062026_STOP" e falha,
+        # duplicando o sinal a cada ciclo enquanto o Stop Loss estiver ativo.
+        sufixo      = "_STOP" if "Stop Loss" in acao else ""
+        chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}{sufixo}"
+
         if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
-                
+
                 linha_sinais_hoje = len(lista_final) + 1
                 enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
-                
+
                 ref_financeira = alvo_out if tipo_sinal == "COMPRA" else custo_medio
-                
-                if "Stop Loss" in acao:
-                    chave_unica += "_STOP"
-                
+
                 novas_linhas_validacao.append([
                     int(prox_id_sinal),
                     tipo_sinal,
@@ -813,7 +816,7 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                     round(preco_atual, 4),
                     "Aguardando",
                     0,
-                    f"'{estado_rl}", 
+                    f"'{estado_rl}",
                     chave_unica
                 ])
                 prox_id_sinal += 1
