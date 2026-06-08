@@ -20,9 +20,7 @@ SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA
 
 # Configurações de Estratégia
 MARGEM_ATENCAO = 0.035    # 3.5% para sinalizar proximidade
-TRAVA_PREJUIZO = True     
-LIMITE_BANCA = 0.25       
-TOLERANCIA_SUJEIRA = 0.15 
+TOLERANCIA_SUJEIRA = 0.15 # até 15% harvest no saldo → ainda conta como Revenda
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 
@@ -229,7 +227,9 @@ def construir_estado_rl_hibrido(row_mercado, item, origem, custo_medio, alvo_luc
                                     (df_trade['Tipo'].str.contains("Compra", case=False))]
             if not compras_item.empty:
                 col_data = 'Timestamp' if 'Timestamp' in df_trade.columns else 'Data'
-                data_compra_str = str(compras_item.iloc[-1][col_data]).split()[0]
+                # iloc[0] = compra mais antiga ainda em custódia (FIFO real).
+                # iloc[-1] seria a mais recente e subestimaria o tempo de custódia.
+                data_compra_str = str(compras_item.iloc[0][col_data]).split()[0]
                 
                 dt_compra = None
                 for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
@@ -409,13 +409,6 @@ sh = gc.open(NOME_PLANILHA)
 inv_data = sh.worksheet("Inventario").get_all_values()
 inv_dict = {row[0]: limpar_numero(row[1]) for row in inv_data[1:]}
 
-try:
-    sfl_data = sh.worksheet("RegistroBruto").get_all_values()
-    df_sfl = pd.DataFrame(sfl_data[1:], columns=sfl_data[0])
-    saldo_sfl = limpar_numero(df_sfl[df_sfl['Recurso'] == 'Flower'].iloc[-1]['Quantidade'])
-except:
-    saldo_sfl = 0
-
 mapa_custo_fifo = calcular_fifo_hibrido(sh, inv_dict)
 trade_data = sh.worksheet("TradeLog").get_all_values()
 df_trade = pd.DataFrame(trade_data[1:], columns=trade_data[0])
@@ -475,7 +468,7 @@ try:
         print(f"🧠 Cérebro RL carregado com sucesso: {len(q_table)} estados restaurados da planilha.")
 except Exception as e:
     try:
-        ws_cerebro = sh.add_worksheet(title="Cerebro_RL", rows="1000", cols="3")
+        ws_cerebro = sh.add_worksheet(title="Cerebro_RL", rows="5000", cols="3")
         ws_cerebro.update(values=[["Estado_RL", "Q_COMPRA", "Q_VENDA"]], range_name='A1', value_input_option='USER_ENTERED')
         print("🧠 Nova aba Cerebro_RL criada com estrutura de 7 caracteres.")
     except:
@@ -596,7 +589,7 @@ if not df_val.empty:
 
             if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
                 recompensa = 1.0
-            elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL"]:
+            elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL", "💰 LUCRO PARCIAL (SPIKE)"]:
                 recompensa = 0.5
             else:
                 recompensa = -1.0
@@ -611,7 +604,11 @@ if not df_val.empty:
 
     print(f"🧠 Cérebro RL Atualizado internamente: {len(q_table)} estados de mercado na memória RAM.")
 
-prox_id_sinal = len(df_val) + 1
+try:
+    max_id_existente = int(pd.to_numeric(df_val['ID_Sinal'], errors='coerce').max()) if not df_val.empty else 0
+except:
+    max_id_existente = len(df_val)
+prox_id_sinal = max_id_existente + 1
 novas_linhas_validacao = []
 
 # Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
@@ -720,6 +717,12 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
     row = d_it.iloc[-1]
     roi_pred = df_ranking[df_ranking['Item'] == item]['ROI'].values[0]
     saldo_item = inv_dict.get(item, 0)
+
+    # Itens com saldo zero não devem gerar sinais de VENDA nem entrar no FIFO.
+    # Permitem sinal de COMPRA se o preço estiver na zona de entrada.
+    # Sem esta guarda, o bot geraria VENDA de itens que você não possui.
+    if saldo_item <= 0 and row['Price'] > (row['Media_Macro'] - mapa_mult_desvio.get(item, 2.0) * row['Desvio_Macro']):
+        continue   # fora da zona de compra e sem estoque — nada a fazer
     custo_medio = mapa_custo_fifo.get(item, row['Media_Macro'])
     
     sujeira = max(0, saldo_item - compras_log.get(item, 0))
