@@ -496,6 +496,16 @@ if not df_val.empty:
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
             df_pos_sinal = d_hist[d_hist['Timestamp'] >= data_sinal_v]
             
+            # Monitoramento_12d tem semântica diferente por tipo de sinal:
+            #   COMPRA      → MAX: confirma se o preço subiu ao alvo de venda
+            #   VENDA _STOP → MAX: necessário para validar "preço ficou abaixo do stop"
+            #   VENDA comum → MIN: confirma se o preço CAIU após a venda (sell foi sábio)
+            is_stop_sinal = "_STOP" in str(row_val['Chave_Unica'])
+            if tipo_v == "COMPRA" or is_stop_sinal:
+                preco_monitoramento = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
+            else:
+                preco_monitoramento = df_pos_sinal['Price'].min() if not df_pos_sinal.empty else preco_sinal_v
+
             max_pos = df_pos_sinal['Price'].max() if not df_pos_sinal.empty else preco_sinal_v
 
             # horas_no_alvo  → COMPRA: horas com Price >= ref_fin_v (alvo de compra)
@@ -551,8 +561,8 @@ if not df_val.empty:
                         else:
                             status_v = "❌ FALHOU"
             
-            df_val.at[idx, 'Dias_Passados'] = int(dias_p)  
-            df_val.at[idx, 'Monitoramento_12d'] = round(max_pos, 4)  
+            df_val.at[idx, 'Dias_Passados'] = int(dias_p)
+            df_val.at[idx, 'Monitoramento_12d'] = round(preco_monitoramento, 4)
             df_val.at[idx, 'Status'] = status_v
 
             # Se o status foi finalizado AGORA, guardamos para atualizar o RL sem duplicidade
