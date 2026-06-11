@@ -513,7 +513,13 @@ if not df_val.empty:
             # Ambos medem se o mercado sustentou a oportunidade tempo suficiente
             # para execução manual — distinguem spike fugaz de janela real.
             horas_no_alvo = int((df_pos_sinal['Price'] >= ref_fin_v).sum())    if not df_pos_sinal.empty else 0
-            horas_venda   = int((df_pos_sinal['Price'] >= preco_sinal_v).sum()) if not df_pos_sinal.empty else 0
+
+            # VENDA comum: conta horas em que o preço ficou <= Referencia_Fin (custo médio).
+            # Se o preço CAIU abaixo do custo médio após a venda → a venda foi sábia.
+            # >= 3h abaixo → 🏆 ACERTOU (TOPO) — queda confirmada, dava pra executar
+            # >= 1h abaixo → 💰 LUCRO PARCIAL (SPIKE) — caiu brevemente
+            #   0h abaixo  → ❌ FALHOU — preço nunca chegou abaixo da ref, venda foi prematura
+            horas_venda = int((df_pos_sinal['Price'] <= ref_fin_v).sum()) if not df_pos_sinal.empty else 0
 
             status_v = "Aguardando"
 
@@ -528,9 +534,9 @@ if not df_val.empty:
             #   caso contrário     → ❌ FALHOU
             #
             # VENDA (não-STOP):
-            #   horas_venda >= 3   → 🏆 ACERTOU (TOPO)       (sustentou ≥3h no nível de venda)
-            #   horas_venda >= 1   → 💰 LUCRO PARCIAL (SPIKE) (preço passou mas fugiu rápido)
-            #   horas_venda == 0   → ❌ FALHOU                 (preço caiu antes de qualquer execução)
+            #   horas_venda >= 3 → 🏆 ACERTOU (TOPO)        (preço caiu ≤ ref_fin por 3h+ → venda confirmada)
+            #   horas_venda >= 1 → 💰 LUCRO PARCIAL (SPIKE)  (caiu brevemente → oportunidade existiu)
+            #   horas_venda == 0 → ❌ FALHOU                  (nunca caiu abaixo da ref → venda prematura)
             #
             # STOP LOSS:
             #   Mantém lógica própria — avalia se o stop protegeu capital após 12 dias.
