@@ -631,17 +631,19 @@ novas_linhas_validacao = []
 # Lido do df_val atual (já em memória, sem custo extra de API).
 # Estrutura: { "Leather_COMPRA": {"preco": 0.1014, "timestamp": datetime} }
 mapa_ultimo_sinal = {}
+usar_dedup_simples = False   # fallback: se True, reverte para 1 sinal/item/dia
 if not df_val.empty:
     try:
         for _, row_u in df_val.iterrows():
-            chave_u = f"{row_u['Item']}_{row_u['Tipo']}"
-            ts_u = pd.to_datetime(row_u['Data_Sinal'], dayfirst=True, errors='coerce')
-            preco_u = limpar_numero(row_u['Preco_Sinal'])
-            # Mantém apenas o registro mais recente por item+tipo
+            chave_u  = f"{row_u['Item']}_{row_u['Tipo']}"
+            ts_u     = pd.to_datetime(row_u['Data_Sinal'], dayfirst=True, errors='coerce')
+            preco_u  = limpar_numero(row_u['Preco_Sinal'])
             if chave_u not in mapa_ultimo_sinal or ts_u > mapa_ultimo_sinal[chave_u]['timestamp']:
                 mapa_ultimo_sinal[chave_u] = {'preco': preco_u, 'timestamp': ts_u}
     except Exception as e:
-        print(f"⚠️  mapa_ultimo_sinal falhou: {e} — usando deduplicação simples.")
+        print(f"⚠️  mapa_ultimo_sinal falhou: {e} — revertendo para deduplicação por data.")
+        mapa_ultimo_sinal  = {}
+        usar_dedup_simples = True
 
 # Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
 # + proxy de MAE do XGBoost (XGB_Audit do ciclo anterior).
