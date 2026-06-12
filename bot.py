@@ -627,6 +627,22 @@ except:
 prox_id_sinal = max_id_existente + 1
 novas_linhas_validacao = []
 
+# Mapa de último sinal por item+tipo — base para a deduplicação híbrida.
+# Lido do df_val atual (já em memória, sem custo extra de API).
+# Estrutura: { "Leather_COMPRA": {"preco": 0.1014, "timestamp": datetime} }
+mapa_ultimo_sinal = {}
+if not df_val.empty:
+    try:
+        for _, row_u in df_val.iterrows():
+            chave_u = f"{row_u['Item']}_{row_u['Tipo']}"
+            ts_u = pd.to_datetime(row_u['Data_Sinal'], dayfirst=True, errors='coerce')
+            preco_u = limpar_numero(row_u['Preco_Sinal'])
+            # Mantém apenas o registro mais recente por item+tipo
+            if chave_u not in mapa_ultimo_sinal or ts_u > mapa_ultimo_sinal[chave_u]['timestamp']:
+                mapa_ultimo_sinal[chave_u] = {'preco': preco_u, 'timestamp': ts_u}
+    except Exception as e:
+        print(f"⚠️  mapa_ultimo_sinal falhou: {e} — usando deduplicação simples.")
+
 # Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
 # + proxy de MAE do XGBoost (XGB_Audit do ciclo anterior).
 # Chamada aqui, após a q_table estar atualizada e df_val pronto em memória.
@@ -807,17 +823,34 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
     ])
 
     if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
-        dt_hoje_str = obter_agora_brt().strftime("%d%m%Y")
+        agora_brt   = obter_agora_brt()
+        dt_hoje_str = agora_brt.strftime("%d%m%Y")
+        dt_hhmm     = agora_brt.strftime("%H%M")
         tipo_sinal  = "COMPRA" if "COMPRAR" in acao else "VENDA"
-
-        # _STOP é definido ANTES da chave para que a verificação de duplicata
-        # use a string final idêntica à gravada no df_val. Sem isso, a checagem
-        # compara "Stone_VENDA_07062026" com "Stone_VENDA_07062026_STOP" e falha,
-        # duplicando o sinal a cada ciclo enquanto o Stop Loss estiver ativo.
         sufixo      = "_STOP" if "Stop Loss" in acao else ""
-        chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}{sufixo}"
 
-        if df_val.empty or (chave_unica not in df_val['Chave_Unica'].values):
+        # --- DEDUPLICAÇÃO HÍBRIDA: mínimo 4h + variação ≥ 3% ---
+        # Condição 1 — tempo mínimo: evita sinais em sequência durante spike de 1h
+        # Condição 2 — variação de preço: só registra quando mercado mudou de verdade
+        # STOP sempre passa independente de variação (proteção de capital não espera)
+        # Resultado: itens estáveis → poucos sinais; itens voláteis → 2-4/dia
+        INTERVALO_MIN_H  = 4      # horas mínimas entre sinais do mesmo item+tipo
+        VARIACAO_MIN_PCT = 0.03   # 3% de variação mínima de preço
+
+        chave_item_tipo = f"{item}_{tipo_sinal}"
+        ultimo          = mapa_ultimo_sinal.get(chave_item_tipo)
+        pode_gerar      = True
+
+        if ultimo and not sufixo:
+            horas_desde = (agora_brt - ultimo['timestamp']).total_seconds() / 3600
+            variacao    = abs(preco_atual - ultimo['preco']) / ultimo['preco'] if ultimo['preco'] > 0 else 1.0
+            if horas_desde < INTERVALO_MIN_H or variacao < VARIACAO_MIN_PCT:
+                pode_gerar = False
+
+        # HHmm na chave distingue múltiplos sinais válidos no mesmo dia
+        chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}_{dt_hhmm}{sufixo}"
+
+        if pode_gerar and chave_unica not in df_val.get('Chave_Unica', pd.Series([], dtype=str)).values:
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
 
                 linha_sinais_hoje = len(lista_final) + 1
@@ -828,7 +861,7 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                 novas_linhas_validacao.append([
                     int(prox_id_sinal),
                     tipo_sinal,
-                    obter_agora_brt().strftime("%d/%m/%Y %H:%M"),
+                    agora_brt.strftime("%d/%m/%Y %H:%M"),
                     item,
                     round(preco_atual, 4),
                     round(ref_financeira, 4),
@@ -839,6 +872,12 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                     chave_unica
                 ])
                 prox_id_sinal += 1
+
+                # Atualiza mapa em memória para deduplicar dentro do mesmo ciclo
+                mapa_ultimo_sinal[chave_item_tipo] = {
+                    'preco':     preco_atual,
+                    'timestamp': agora_brt
+                }
 
 if novas_linhas_validacao:
     ws_val.append_rows(novas_linhas_validacao, value_input_option='USER_ENTERED')
