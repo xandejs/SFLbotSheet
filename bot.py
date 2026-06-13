@@ -554,7 +554,9 @@ if not df_val.empty:
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
                     if dias_p >= 12:
-                        if max_pos <= preco_sinal_v:
+                        # ref_fin_v == preco_sinal_v para STOP (gravados iguais).
+                        # max_pos <= ref_fin_v: preço nunca voltou acima do stop → protetivo.
+                        if max_pos <= ref_fin_v:
                             status_v = "🏆 ACERTOU (STOP PROTETIVO)"
                         else:
                             status_v = "❌ FALHOU (STOP PREMATURO)"
@@ -858,7 +860,17 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                 linha_sinais_hoje = len(lista_final) + 1
                 enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
 
-                ref_financeira = alvo_out if tipo_sinal == "COMPRA" else custo_medio
+                # Referencia_Fin por tipo de sinal:
+                # COMPRA     → alvo_out (preço de saída desejado, acima do sinal)
+                # VENDA STOP → preco_atual (o próprio nível do stop — validação checa se
+                #              o preço ficou abaixo dele após a saída)
+                # VENDA comum→ custo_medio (confirma se o preço caiu abaixo do custo)
+                if tipo_sinal == "COMPRA":
+                    ref_financeira = alvo_out
+                elif sufixo == "_STOP":
+                    ref_financeira = preco_atual   # referência = nível do stop
+                else:
+                    ref_financeira = custo_medio
 
                 novas_linhas_validacao.append([
                     int(prox_id_sinal),
