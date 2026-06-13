@@ -1,7 +1,3 @@
-Aqui está uma versão aprimorada, profissional e estruturada da descrição do seu bot. Ela foi desenhada para valorizar a complexidade técnica do projeto, deixando claro tanto o modelo de inteligência artificial quanto a engenharia financeira por trás das decisões de trade.
-
----
-
 # 🤖 SFL Trading Bot: Inteligência Artificial Aplicada ao Mercado de Sunflower Land
 
 > **Descrição Geral:** Sistema automatizado de inteligência artificial quantitativa especializado no ecossistema de *Sunflower Land*. O bot combina modelagem preditiva estatística, aprendizado por reforço e engenharia financeira de precisão para gerar sinais preditivos de **COMPRA** e **VENDA**, otimizando o Retorno sobre o Investimento (ROI) de ativos e recursos no marketplace do jogo.
