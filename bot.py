@@ -266,7 +266,7 @@ def pontuar_status(r):
     if "💰 LUCRO"   in st: return 0.5
     return 0.0
 
-def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None):
+def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_mem=None):
     """
     Constrói os três mapas de calibração combinando duas fontes de verdade:
 
@@ -385,7 +385,7 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None):
     # ------------------------------------------------------------------
     # INDICADOR DE BOOTSTRAP
     # ------------------------------------------------------------------
-    n_estados = len(q_table)
+    n_estados = len(q_table_mem) if q_table_mem is not None else 0
     if n_estados < 10:
         print(f"🌱 BOOTSTRAP ATIVO: Cerebro_RL com {n_estados} estados. "
               f"Decisões por estatística pura.")
@@ -429,7 +429,7 @@ try:
     ws_val = sh.worksheet("Validacao_Sinais")
     val_data = ws_val.get_all_values()
 except:
-    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="1000", cols="11")
+    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="10000", cols="11")
     val_data = []
 
 if not val_data or len(val_data) == 0:
@@ -650,7 +650,7 @@ if not df_val.empty:
 # Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
 # + proxy de MAE do XGBoost (XGB_Audit do ciclo anterior).
 # Chamada aqui, após a q_table estar atualizada e df_val pronto em memória.
-mapa_mult_desvio, mapa_veto, mapa_ajuste_roi = construir_calibracao_hibrida(sh, df_bruto, df_val_mem=df_val)
+mapa_mult_desvio, mapa_veto, mapa_ajuste_roi = construir_calibracao_hibrida(sh, df_bruto, df_val_mem=df_val, q_table_mem=q_table)
 
 # ==============================================================================
 # 2. IA E TREINAMENTO
@@ -694,7 +694,10 @@ for item in df_bruto['Item'].unique():
         pred = model.predict(ultima_linha)[0]
         preco_atual = d_it.iloc[-1]['Price']
         roi = ((pred - preco_atual) / preco_atual) * 100
-        roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
+        # ROI líquido: desconta a taxa de marketplace sobre o preço de venda final.
+        # Sem isso, um ROI bruto de 8.7% vira -2.2% líquido — decisão completamente diferente.
+        roi_liquido = (((pred * (1 - TAXA_MARKETPLACE)) - preco_atual) / preco_atual) * 100
+        roi_ajustado = roi_liquido + mapa_ajuste_roi.get(item, 0.0)
 
         # --- MÉTRICAS NO HOLDOUT (aprendizado real) ---
         mae = rmse = acerto_direcao = None
@@ -717,11 +720,10 @@ for item in df_bruto['Item'].unique():
 
         ranking.append({
             'Item':          item,
-            'ROI':           roi,
+            'ROI':           roi_liquido,
             'ROI_Ajustado':  roi_ajustado
         })
 
-        # Acumula linha de auditoria para gravar depois
         audit_linhas.append([
             obter_agora_brt().strftime("%d/%m/%Y %H:%M"),
             item,
@@ -730,7 +732,7 @@ for item in df_bruto['Item'].unique():
             round(acerto_direcao, 1) if acerto_direcao is not None else "",
             n_treino,
             n_teste,
-            round(roi, 2)
+            round(roi_liquido, 2)
         ])
 
     except Exception as e:
@@ -848,14 +850,26 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         if ultimo and not sufixo:
             horas_desde = (agora_brt - ultimo['timestamp']).total_seconds() / 3600
             variacao    = abs(preco_atual - ultimo['preco']) / ultimo['preco'] if ultimo['preco'] > 0 else 1.0
-            if horas_desde < INTERVALO_MIN_H or variacao < VARIACAO_MIN_PCT:
-                pode_gerar = False
+
+            if horas_desde >= 24:
+                pode_gerar = True    # 1 dia completo → sempre permite novo sinal
+                                     # mercado pode estar estável e a condição ainda ser válida
+            elif horas_desde < INTERVALO_MIN_H:
+                pode_gerar = False   # muito recente → bloqueia independente de variação
+            elif variacao < VARIACAO_MIN_PCT:
+                pode_gerar = False   # entre 4-24h e preço não moveu → sinal redundante
 
         # HHmm na chave distingue múltiplos sinais válidos no mesmo dia
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}_{dt_hhmm}{sufixo}"
 
         if pode_gerar and chave_unica not in df_val.get('Chave_Unica', pd.Series([], dtype=str)).values:
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
+                # Fallback de segurança: se mapa_ultimo_sinal falhou, usa deduplicação
+                # por data simples (1 sinal/item/dia) para evitar spam por ciclo.
+                if usar_dedup_simples:
+                    chave_fallback = f"{item}_{tipo_sinal}_{dt_hoje_str}{sufixo}"
+                    if not df_val.empty and df_val['Chave_Unica'].astype(str).str.startswith(chave_fallback).any():
+                        continue
 
                 linha_sinais_hoje = len(lista_final) + 1
                 enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
