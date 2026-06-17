@@ -847,17 +847,17 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         ultimo          = mapa_ultimo_sinal.get(chave_item_tipo)
         pode_gerar      = True
 
-        if ultimo and not sufixo:
+        if ultimo:
             horas_desde = (agora_brt - ultimo['timestamp']).total_seconds() / 3600
             variacao    = abs(preco_atual - ultimo['preco']) / ultimo['preco'] if ultimo['preco'] > 0 else 1.0
 
             if horas_desde >= 24:
                 pode_gerar = True    # 1 dia completo → sempre permite novo sinal
-                                     # mercado pode estar estável e a condição ainda ser válida
             elif horas_desde < INTERVALO_MIN_H:
-                pode_gerar = False   # muito recente → bloqueia independente de variação
-            elif variacao < VARIACAO_MIN_PCT:
-                pode_gerar = False   # entre 4-24h e preço não moveu → sinal redundante
+                pode_gerar = False   # muito recente → bloqueia todos os tipos
+            elif not sufixo and variacao < VARIACAO_MIN_PCT:
+                pode_gerar = False   # entre 4-24h sem variação → bloqueia só não-STOP
+                                     # STOP sempre passa se >= 4h (preço já está abaixo do custo)
 
         # HHmm na chave distingue múltiplos sinais válidos no mesmo dia
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}_{dt_hhmm}{sufixo}"
