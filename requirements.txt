@@ -1,0 +1,10 @@
+# Versões fixas garantem que o cache nunca invalida por mudança silenciosa de dependência.
+# Para atualizar: edite a versão aqui → cache invalida automaticamente na próxima run.
+pandas==2.2.2
+numpy==1.26.4
+xgboost==2.0.3
+gspread==6.1.2
+oauth2client==4.1.3
+gspread-formatting==1.1.2
+scikit-learn==1.4.2
+requests==2.32.3
