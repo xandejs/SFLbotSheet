@@ -694,10 +694,11 @@ for item in df_bruto['Item'].unique():
         pred = model.predict(ultima_linha)[0]
         preco_atual = d_it.iloc[-1]['Price']
         roi = ((pred - preco_atual) / preco_atual) * 100
-        # ROI líquido: desconta a taxa de marketplace sobre o preço de venda final.
-        # Sem isso, um ROI bruto de 8.7% vira -2.2% líquido — decisão completamente diferente.
-        roi_liquido = (((pred * (1 - TAXA_MARKETPLACE)) - preco_atual) / preco_atual) * 100
-        roi_ajustado = roi_liquido + mapa_ajuste_roi.get(item, 0.0)
+        # ROI_Prev_% é a previsão de movimento de preço do XGBoost — sinal direcional.
+        # A taxa de marketplace (10%) já está embutida no Alvo_Saída via:
+        #   alvo_lucro = (custo_medio × (1 + LUCRO_REAL_DESEJADO)) / (1 - TAXA_MARKETPLACE)
+        # Aplicar a taxa aqui seria contá-la duas vezes. O ROI exibido é bruto.
+        roi_ajustado = roi + mapa_ajuste_roi.get(item, 0.0)
 
         # --- MÉTRICAS NO HOLDOUT (aprendizado real) ---
         mae = rmse = acerto_direcao = None
@@ -720,7 +721,7 @@ for item in df_bruto['Item'].unique():
 
         ranking.append({
             'Item':          item,
-            'ROI':           roi_liquido,
+            'ROI':           roi,
             'ROI_Ajustado':  roi_ajustado
         })
 
@@ -732,7 +733,7 @@ for item in df_bruto['Item'].unique():
             round(acerto_direcao, 1) if acerto_direcao is not None else "",
             n_treino,
             n_teste,
-            round(roi_liquido, 2)
+            round(roi, 2)
         ])
 
     except Exception as e:
