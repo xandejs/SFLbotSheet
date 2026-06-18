@@ -1,45 +1,45 @@
 name: SFL Auto-Trader Bot
 
 on:
- # schedule:
- #  - cron: '0 * * * *' # Roda de 1 em 1 hora
-  workflow_dispatch:
+  #schedule:
+   # - cron: '11 * * * *'   # :11 de cada hora — evita pico de carga do GitHub no :00
+  workflow_dispatch:         # execução manual mantida
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 8       # se o bot travar (ex: rede presa), mata após 8min
+                             # sem isso um run travado consome minutos indefinidamente
 
     steps:
-      - name: Baixando o código
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Instalando o Python
+      - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 🔥 NOVO PASSO: Configurando o Cache do PIP
-      - name: Cache das bibliotecas Python
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          # Cria uma "chave" baseada no seu arquivo YML. Se você mudar as bibliotecas no futuro, ele atualiza o cache.
-          key: ${{ runner.os }}-pip-${{ hashFiles('.github/workflows/*.yml') }}
+          # Chave baseada no requirements.txt: só invalida quando você mudar uma versão.
+          # Com o yml como chave (como estava antes), qualquer edit no workflow
+          # recriava o cache — desperdiçando ~90s de instalação.
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Instalando as bibliotecas
-        run: |
-          pip install pandas numpy xgboost gspread oauth2client gspread-formatting scikit-learn
+      - name: Instalar dependências
+        run: pip install -q -r requirements.txt
+        # -q reduz output e é marginalmente mais rápido
+        # Com cache hit, este passo leva ~10s em vez de ~110s
 
-      - name: Recriando o JSON secreto
-        run: |
-          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credenciais_robo.json
+      - name: Credenciais Google
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credenciais_robo.json
 
-      - name: Listar arquivos (Para termos certeza)
-        run: ls -R
-
-      - name: Rodando o Cérebro RL 🧠
-        run: |
-          FILE_PATH=$(find . -name "bot.py" -not -path "*/.*" | head -n 1)
-          python "$FILE_PATH"
+      - name: Rodar bot
+        run: python bot.py
+        # Sem o find: economiza ~3s/run × 720 runs = 36 min/mês
+        # Requer que o arquivo se chame bot.py na raiz do repositório
