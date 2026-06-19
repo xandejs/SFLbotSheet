@@ -633,7 +633,8 @@ novas_linhas_validacao = []
 # Lido do df_val atual (já em memória, sem custo extra de API).
 # Estrutura: { "Leather_COMPRA": {"preco": 0.1014, "timestamp": datetime} }
 mapa_ultimo_sinal = {}
-usar_dedup_simples = False   # fallback: se True, reverte para 1 sinal/item/dia
+sinais_pendentes  = set()   # "Item_TIPO" com Status=Aguardando — bloqueia novo registro
+usar_dedup_simples = False
 if not df_val.empty:
     try:
         for _, row_u in df_val.iterrows():
@@ -642,9 +643,14 @@ if not df_val.empty:
             preco_u  = limpar_numero(row_u['Preco_Sinal'])
             if chave_u not in mapa_ultimo_sinal or ts_u > mapa_ultimo_sinal[chave_u]['timestamp']:
                 mapa_ultimo_sinal[chave_u] = {'preco': preco_u, 'timestamp': ts_u}
+            # Marca sinais ainda em aberto — impede registro duplicado enquanto
+            # o primeiro ainda aguarda validação (12 dias)
+            if str(row_u.get('Status', '')).strip() == 'Aguardando':
+                sinais_pendentes.add(chave_u)
     except Exception as e:
         print(f"⚠️  mapa_ultimo_sinal falhou: {e} — revertendo para deduplicação por data.")
         mapa_ultimo_sinal  = {}
+        sinais_pendentes   = set()
         usar_dedup_simples = True
 
 # Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
@@ -848,17 +854,23 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         ultimo          = mapa_ultimo_sinal.get(chave_item_tipo)
         pode_gerar      = True
 
-        if ultimo:
+        # Prioridade 1: já existe sinal Aguardando para este item+tipo?
+        # Bloqueia novo registro em Validacao_Sinais até o sinal existente concluir (12 dias).
+        # O item continua aparecendo em Sinais_Hoje — apenas não duplica na validação.
+        # Exceção: STOP sempre registra (proteção de capital não espera fila).
+        if chave_item_tipo in sinais_pendentes and not sufixo:
+            pode_gerar = False
+
+        if pode_gerar and ultimo:
             horas_desde = (agora_brt - ultimo['timestamp']).total_seconds() / 3600
             variacao    = abs(preco_atual - ultimo['preco']) / ultimo['preco'] if ultimo['preco'] > 0 else 1.0
 
             if horas_desde >= 24:
-                pode_gerar = True    # 1 dia completo → sempre permite novo sinal
+                pode_gerar = True
             elif horas_desde < INTERVALO_MIN_H:
-                pode_gerar = False   # muito recente → bloqueia todos os tipos
+                pode_gerar = False
             elif not sufixo and variacao < VARIACAO_MIN_PCT:
-                pode_gerar = False   # entre 4-24h sem variação → bloqueia só não-STOP
-                                     # STOP sempre passa se >= 4h (preço já está abaixo do custo)
+                pode_gerar = False
 
         # HHmm na chave distingue múltiplos sinais válidos no mesmo dia
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}_{dt_hhmm}{sufixo}"
