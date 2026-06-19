@@ -638,7 +638,7 @@ usar_dedup_simples = False
 if not df_val.empty:
     try:
         for _, row_u in df_val.iterrows():
-            chave_u  = f"{row_u['Item']}_{row_u['Tipo']}"
+            chave_u  = f"{str(row_u['Item']).strip()}_{str(row_u['Tipo']).strip().upper()}"
             ts_u     = pd.to_datetime(row_u['Data_Sinal'], dayfirst=True, errors='coerce')
             preco_u  = limpar_numero(row_u['Preco_Sinal'])
             if chave_u not in mapa_ultimo_sinal or ts_u > mapa_ultimo_sinal[chave_u]['timestamp']:
@@ -850,7 +850,7 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         INTERVALO_MIN_H  = 4      # horas mínimas entre sinais do mesmo item+tipo
         VARIACAO_MIN_PCT = 0.03   # 3% de variação mínima de preço
 
-        chave_item_tipo = f"{item}_{tipo_sinal}"
+        chave_item_tipo = f"{item}_{tipo_sinal.upper()}"
         ultimo          = mapa_ultimo_sinal.get(chave_item_tipo)
         pode_gerar      = True
 
