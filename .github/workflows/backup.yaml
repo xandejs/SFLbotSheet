@@ -2,19 +2,22 @@ name: SFL Cerebro_RL Weekly Backup
 
 on:
   schedule:
-    - cron: '11 23 * * 0'   # Executa todo domingo às 23:11 (evitando o pico das 00:00)
-  workflow_dispatch:         # Mantém o botão de executar manualmente se você quiser forçar um backup
+    - cron: '11 23 * * 0'   # Executa todo domingo às 23:11
+  workflow_dispatch:         # Permite executar manualmente
 
 jobs:
   run-backup:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    
+    # 🌟 ADICIONE ESTAS DUAS LINHAS AQUI PARA LIBERAR O REPOSITÓRIO:
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Código
         uses: actions/checkout@v4
         with:
-          # Garante que o GitHub Actions use permissão para enviar o arquivo de volta ao repositório
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python 3.10
@@ -26,7 +29,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          # Reutiliza o cache do requirements.txt que você já tem para carregar em ~10 segundos
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
@@ -45,11 +47,9 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           
-          # Adiciona a pasta de backups criados pelo script
+          # Garante que a pasta existe antes de tentar adicionar
+          mkdir -p backups_cerebro
           git add backups_cerebro/
           
-          # Commita as alterações. Se não houver nada novo, não quebra o fluxo
           git commit -m "🤖 [Automático] Backup Semanal da Q-Table (Cérebro RL)" || echo "Nenhum dado novo para salvar."
-          
-          # Envia os dados de volta para salvar no GitHub de forma definitiva
           git push
