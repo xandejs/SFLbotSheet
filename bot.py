@@ -560,35 +560,12 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_me
         if not df_concluidos.empty:
             df_concluidos['Pontos'] = df_concluidos.apply(pontuar_status, axis=1)
 
-            for item_c, group in df_concluidos.groupby('Item'):
-                n    = len(group)
-                taxa = (group['Pontos'].sum() / n) * 100
-                confianca = min(1.0, n / 10.0)   # plena confiança com 10+ sinais
-
-                if taxa >= 70:
-                    mapa_mult[item_c] = 2.0
-                    mapa_roi[item_c]  = 0.0
-                    mapa_veto[item_c] = False
-                elif taxa >= 45:
-                    mapa_mult[item_c] = 2.4
-                    mapa_roi[item_c]  = -5.0
-                    mapa_veto[item_c] = False
-                else:
-                    mapa_mult[item_c] = 2.4
-                    mapa_roi[item_c]  = -5.0
-                    mapa_veto[item_c] = True
-
-                _confianca[item_c] = confianca
-
-            n_itens = df_concluidos['Item'].nunique()
-            print(f"📊 Calibração por sinais reais: {n_itens} itens | "
-                  f"{len(df_concluidos)} sinais concluídos.")
-
-            # Recalibra com taxa de acerto Bayesiana (item 2 dos parâmetros
-            # adaptativos) em vez do threshold fixo de 45% usado acima.
-            # Sobrescreve in-place os mapas para os itens com dados suficientes.
+            # Calibração Bayesiana — substitui o threshold fixo 45%/70%.
+            # Usa valor esperado (EV) por sinal em vez de taxa bruta,
+            # e exige amostra mínima antes de vetar (evita falso negativo com poucos dados).
             calibrar_por_taxa_confianca(sh, df_val_mem, mapa_mult, mapa_roi, mapa_veto)
-            print(f"📈 Calibração Bayesiana aplicada sobre {n_itens} itens.")
+            print(f"📈 Calibração Bayesiana: {df_concluidos['Item'].nunique()} itens | "
+                  f"{len(df_concluidos)} sinais concluídos processados.")
         else:
             print("ℹ️  Calibração: nenhum sinal concluído ainda — fase bootstrap.")
     else:
