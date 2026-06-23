@@ -51,7 +51,7 @@ def calcular_veto_rl(estado_rl, q_table, n_obs_por_estado=None):
 
     Threshold adaptativo:
       - Com poucos dados (n<5): -0.5  (precisa de evidência forte para vetar)
-      - Com muitos dados (n>20): -0.2  (confiante, veta mais cedo)
+      - Com muitos dados (n>20): -0.45 (confiante, veta com evidência consolidada)
 
     Bônus de exploração:
       - Q_COMPRA > +0.5: adiciona +5% ao ROI ajustado (prioriza estado excelente)
@@ -566,6 +566,13 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_me
             calibrar_por_taxa_confianca(sh, df_val_mem, mapa_mult, mapa_roi, mapa_veto)
             print(f"📈 Calibração Bayesiana: {df_concluidos['Item'].nunique()} itens | "
                   f"{len(df_concluidos)} sinais concluídos processados.")
+
+            # Popula _confianca para itens da FONTE 1 — necessário para que
+            # FONTE 2 (XGB_Audit proxy) calcule peso_xgb corretamente.
+            # Sem isso, peso_xgb = 1 - _confianca.get(item, 1.0) = 0 para
+            # todos os itens com histórico real, anulando o ajuste de MAE.
+            for item_c, group in df_concluidos.groupby('Item'):
+                _confianca[item_c] = min(1.0, len(group) / 10.0)
         else:
             print("ℹ️  Calibração: nenhum sinal concluído ainda — fase bootstrap.")
     else:
@@ -1020,10 +1027,14 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
     saldo_item = inv_dict.get(item, 0)
 
     # Itens com saldo zero não devem gerar sinais de VENDA nem entrar no FIFO.
-    # Permitem sinal de COMPRA se o preço estiver na zona de entrada.
-    # Sem esta guarda, o bot geraria VENDA de itens que você não possui.
     if saldo_item <= 0 and row['Price'] > (row['Media_Macro'] - mapa_mult_desvio.get(item, 2.0) * row['Desvio_Macro']):
-        continue   # fora da zona de compra e sem estoque — nada a fazer
+        continue
+
+    # Guarda NaN: itens recém-adicionados ao jogo (<120h de histórico) têm
+    # Media_Macro=NaN. Sem esta verificação, alvo_in/alvo_out ficam NaN e
+    # "nan" é gravado no Sinais_Hoje, corrompendo a planilha visualmente.
+    if pd.isna(row.get('Media_Macro')) or pd.isna(row.get('Desvio_Macro')):
+        continue
     custo_medio = mapa_custo_fifo.get(item, row['Media_Macro'])
     
     sujeira = max(0, saldo_item - compras_log.get(item, 0))
@@ -1112,11 +1123,12 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         obter_agora_brt().strftime("%d/%m %H:%M")
     ])
 
-    if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"]:
+    if acao in ["🟢 COMPRAR", "🔴 VENDER", "🔴 VENDER (Lucro Disponível)", "⚠️ VENDER (Stop Loss)"] \
+            or (em_crash and "COMPRAR" in acao):
         agora_brt   = obter_agora_brt()
         dt_hoje_str = agora_brt.strftime("%d%m%Y")
         dt_hhmm     = agora_brt.strftime("%H%M")
-        tipo_sinal  = "COMPRA" if "COMPRAR" in acao else "VENDA"
+        tipo_sinal  = "COMPRA" if ("COMPRAR" in acao or em_crash) else "VENDA"
         sufixo      = "_STOP" if "Stop Loss" in acao else ""
 
         # --- DEDUPLICAÇÃO HÍBRIDA: mínimo 4h + variação ≥ 3% ---
