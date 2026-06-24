@@ -1113,7 +1113,7 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
 
     lista_final.append([
         item, 
-        round(roi_pred_exibido, 1), 
+        round(roi_pred_exibido * (1 - TAXA_MARKETPLACE) - TAXA_MARKETPLACE * 100, 1), 
         acao, 
         round(alvo_in, 4), 
         round(alvo_out, 4), 
