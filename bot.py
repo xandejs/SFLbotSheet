@@ -24,6 +24,12 @@ MARGEM_ATENCAO = 0.035    # [DEPRECATED] 3.5% fixo — substituído por calcular
                            # (item 4 dos parâmetros adaptativos). Mantido apenas como referência.
 TOLERANCIA_SUJEIRA = 0.15 # até 15% harvest no saldo → ainda conta como Revenda
 
+# Piso de posição mínima em SFL para tratar um item como Revenda de fato.
+# Sem isso, compras incidentais (ex: Stone comprado para crafting, não para flip)
+# disparam Stop Loss e alvo de lucro mesmo com posição irrisória — o histórico
+# de compra existe, mas não há intenção real de trade. Ajuste ao tamanho da sua banca.
+POSICAO_MINIMA_SFL = 3.0
+
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 
 # Cabeçalhos da aba de auditoria do XGBoost — definido aqui para estar
@@ -1039,6 +1045,13 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
     
     sujeira = max(0, saldo_item - compras_log.get(item, 0))
     origem = 2 if (compras_log.get(item, 0) > 0 and (sujeira/saldo_item if saldo_item > 0 else 0) <= TOLERANCIA_SUJEIRA) else 1
+
+    # Piso de posição mínima: se o valor da posição (saldo × preço atual) não
+    # atinge POSICAO_MINIMA_SFL, trata como Colheita mesmo com histórico de compra.
+    # Evita Stop Loss e alvo de lucro em itens comprados só para uso (crafting).
+    valor_posicao = saldo_item * row['Price']
+    if origem == 2 and valor_posicao < POSICAO_MINIMA_SFL:
+        origem = 1
     
     preco_atual = row['Price']
     
@@ -1112,8 +1125,11 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         acao = f"⚠️ COMPRAR (QUEDA {var24h:.1f}% em 24h)"
 
     lista_final.append([
-        item, 
-        round(roi_pred_exibido * (1 - TAXA_MARKETPLACE) - TAXA_MARKETPLACE * 100, 1), 
+        item,
+        # ROI visual: desconta a taxa de 10% do marketplace para mostrar o retorno real.
+        # Fórmula: roi_bruto × 0.9 − 10  (ex: 8.4% → −2.4% | −25.8% → −33.2%)
+        # Não altera ranking, stop loss, Validacao_Sinais nem nenhum outro cálculo.
+        round(roi_pred_exibido * (1 - TAXA_MARKETPLACE) - TAXA_MARKETPLACE * 100, 1),
         acao, 
         round(alvo_in, 4), 
         round(alvo_out, 4), 
