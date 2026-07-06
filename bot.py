@@ -19,6 +19,15 @@ LUCRO_REAL_DESEJADO = 0.07  # 7% de lucro real alvo
 DIAS_SWING = 12            
 SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA 
 
+# Prazo de desistência da validação — NÃO afeta DIAS_SWING/SHIFT_ALVO (o horizonte
+# de previsão do XGBoost continua em 12 dias, intocado). Esta constante só governa
+# até quando um sinal em Validacao_Sinais pode continuar "Aguardando" antes de ser
+# forçado a concluir como FALHOU/LUCRO PARCIAL. Um item que demora mais para atingir
+# o alvo não é necessariamente ruim — só precisa de um Retorno_Anualizado_% maior
+# para compensar o tempo de capital parado, e isso já é penalizado naturalmente
+# em calcular_alocacao_recursos() via composição (1+roi)^(365/dias_medio).
+DIAS_MAX_MONITORAMENTO = 30
+
 # Configurações de Estratégia
 MARGEM_ATENCAO = 0.035    # [DEPRECATED] 3.5% fixo — substituído por calcular_margem_atencao()
                            # (item 4 dos parâmetros adaptativos). Mantido apenas como referência.
@@ -898,37 +907,40 @@ if not df_val.empty:
 
             status_v = "Aguardando"
 
-            # --- BLOCO DE VALIDAÇÃO COM SUSTENTAÇÃO DE PREÇO ---
-            # Regra geral: sinal só conclui após dias_p >= 12.
-            # max_pos → registro visual no Monitoramento_12d (painel), não decide status.
+            # --- BLOCO DE VALIDAÇÃO COM SUSTENTAÇÃO DE PREÇO E JANELA DE GRAÇA ---
+            # A partir de dias_p >= DIAS_SWING (12), o sinal já PODE concluir se
+            # atingiu sustentação plena (🏆 ACERTOU) — quanto mais cedo, melhor,
+            # não faz sentido esperar até 30 dias para confirmar algo que já aconteceu.
+            # Mas se ainda não atingiu, o sinal ganha até DIAS_MAX_MONITORAMENTO (30)
+            # dias de prazo antes de ser forçado a um veredito final (LUCRO PARCIAL
+            # ou FALHOU). Isso reflete que "não bateu o alvo em 12 dias" não é fracasso
+            # — é só capital ainda parado, e o ranking de alocação já penaliza isso
+            # via retorno anualizado sem precisar de um corte rígido aqui.
             #
             # COMPRA:
-            #   horas_no_alvo >= 3 → 🏆 ACERTOU        (sustentou ≥3h no alvo)
-            #   horas_no_alvo >= 1 → 💰 LUCRO PARCIAL  (atingiu mas fugaz)
-            #   max_pos >= piso    → 💰 LUCRO PARCIAL  (não bateu alvo mas cobriu custo)
-            #   caso contrário     → ❌ FALHOU
+            #   horas_no_alvo >= 3 → 🏆 ACERTOU (a qualquer momento entre 12-30 dias)
+            #   horas_no_alvo >= 1 ou max_pos >= piso, e dias_p >= 30 → 💰 LUCRO PARCIAL
+            #   nada disso, e dias_p >= 30                            → ❌ FALHOU
+            #   caso contrário (ainda dentro do prazo)                → segue Aguardando
             #
-            # VENDA (não-STOP):
-            #   horas_venda >= 3 → 🏆 ACERTOU (TOPO)        (preço caiu ≤ ref_fin por 3h+ → venda confirmada)
-            #   horas_venda >= 1 → 💰 LUCRO PARCIAL (SPIKE)  (caiu brevemente → oportunidade existiu)
-            #   horas_venda == 0 → ❌ FALHOU                  (nunca caiu abaixo da ref → venda prematura)
-            #
-            # STOP LOSS:
-            #   Mantém lógica própria — avalia se o stop protegeu capital após 12 dias.
+            # VENDA (não-STOP): mesma lógica espelhada com horas_venda.
+            # STOP LOSS: sem capital parado após o stop — mantém veredito em 12 dias.
             if tipo_v == "COMPRA":
-                if dias_p >= 12:
+                if dias_p >= DIAS_SWING:
                     piso_lucro_real = preco_sinal_v * (1 + TAXA_MARKETPLACE + LUCRO_REAL_DESEJADO)
                     if horas_no_alvo >= 3:
                         status_v = "🏆 ACERTOU"
-                    elif horas_no_alvo >= 1:
-                        status_v = "💰 LUCRO PARCIAL"
-                    elif max_pos >= piso_lucro_real:
-                        status_v = "💰 LUCRO PARCIAL"
+                    elif horas_no_alvo >= 1 or max_pos >= piso_lucro_real:
+                        if dias_p >= DIAS_MAX_MONITORAMENTO:
+                            status_v = "💰 LUCRO PARCIAL"
+                        # else: segue "Aguardando" — ainda dentro do prazo de graça
                     else:
-                        status_v = "❌ FALHOU"
+                        if dias_p >= DIAS_MAX_MONITORAMENTO:
+                            status_v = "❌ FALHOU"
+                        # else: segue "Aguardando"
             elif tipo_v == "VENDA":
                 if "_STOP" in str(row_val['Chave_Unica']):
-                    if dias_p >= 12:
+                    if dias_p >= DIAS_SWING:
                         # ref_fin_v == preco_sinal_v para STOP (gravados iguais).
                         # max_pos <= ref_fin_v: preço nunca voltou acima do stop → protetivo.
                         if max_pos <= ref_fin_v:
@@ -936,22 +948,29 @@ if not df_val.empty:
                         else:
                             status_v = "❌ FALHOU (STOP PREMATURO)"
                 else:
-                    if dias_p >= 12:
+                    if dias_p >= DIAS_SWING:
                         if horas_venda >= 3:
                             status_v = "🏆 ACERTOU (TOPO)"
                         elif horas_venda >= 1:
-                            status_v = "💰 LUCRO PARCIAL (SPIKE)"
+                            if dias_p >= DIAS_MAX_MONITORAMENTO:
+                                status_v = "💰 LUCRO PARCIAL (SPIKE)"
+                            # else: segue "Aguardando"
                         else:
-                            status_v = "❌ FALHOU"
+                            if dias_p >= DIAS_MAX_MONITORAMENTO:
+                                status_v = "❌ FALHOU"
+                            # else: segue "Aguardando"
             
             df_val.at[idx, 'Dias_Passados'] = int(dias_p)
             df_val.at[idx, 'Monitoramento_12d'] = round(preco_monitoramento, 4)
             df_val.at[idx, 'Status'] = status_v
 
-            # ❌ FALHOU: capital ficou parado os 12 dias inteiros sem sucesso —
-            # usa DIAS_SWING como tempo de imobilização para a métrica de EV/dia.
-            if "❌" in status_v and dias_ate_alvo is None:
-                dias_ate_alvo = float(DIAS_SWING)
+            # Fallback de Dias_Ate_Alvo quando o sinal concluiu sem nunca ter
+            # atingido sustentação plena (❌ FALHOU, ou 💰 LUCRO PARCIAL decidido
+            # apenas por ter batido o prazo de graça). Usa dias_p real — o tempo
+            # verdadeiro que o capital ficou parado — em vez de uma constante fixa,
+            # já que agora a conclusão pode ocorrer em qualquer dia entre 12 e 30.
+            if dias_ate_alvo is None and status_v not in ("Aguardando",):
+                dias_ate_alvo = float(dias_p)
             df_val.at[idx, 'Dias_Ate_Alvo'] = dias_ate_alvo if dias_ate_alvo is not None else ""
 
             # Se o status foi finalizado AGORA, guardamos para atualizar o RL sem duplicidade
