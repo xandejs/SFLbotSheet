@@ -28,7 +28,7 @@ TOLERANCIA_SUJEIRA = 0.15 # até 15% harvest no saldo → ainda conta como Reven
 # Sem isso, compras incidentais (ex: Stone comprado para crafting, não para flip)
 # disparam Stop Loss e alvo de lucro mesmo com posição irrisória — o histórico
 # de compra existe, mas não há intenção real de trade. Ajuste ao tamanho da sua banca.
-POSICAO_MINIMA_SFL = 3.0
+POSICAO_MINIMA_SFL = 5.0
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 
@@ -298,6 +298,97 @@ def detectar_regime(d_item, janela_crash_h=24, limiar_queda=-0.12):
     variacao_24h = (preco_atual - preco_24h) / preco_24h
 
     return variacao_24h < limiar_queda, round(variacao_24h * 100, 2)
+
+
+def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
+    """
+    Calcula pesos de alocacao de capital por item, combinando taxa de acerto
+    Bayesiana com retorno anualizado por velocidade real de capital (Dias_Ate_Alvo).
+
+    Por que anualizado e nao ROI/dias simples: 10% em 10 dias bate 20% em 20 dias
+    porque o capital gira 2x mais rapido -- isso so aparece corretamente ao compor
+    (1+roi)^(365/dias) - 1, nao ao dividir roi/dias (que da a MESMA taxa diaria).
+
+    Fonte: Validacao_Sinais (nao TradeLog) -- cobre os 63 itens sistematicamente,
+    sem o vies de selecao de quais itens voce escolheu operar manualmente.
+
+    Retorna DataFrame ordenado por peso decrescente.
+    """
+    colunas_saida = ["Item", "Taxa_Acerto_%", "EV_Sinal", "ROI_Medio_%",
+                      "Dias_Medio", "Retorno_Anualizado_%", "Score", "Peso_Alocacao_%"]
+
+    if df_val_mem is None or df_val_mem.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df_conc = df_val_mem[df_val_mem['Status'].astype(str).str.contains("🏆|❌|💰", na=False)].copy()
+    if df_conc.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    def pontos(st):
+        if "🏆" in st: return 1.0
+        if "💰" in st: return 0.5
+        return 0.0
+
+    df_conc['Pts'] = df_conc['Status'].astype(str).apply(pontos)
+    df_conc['Preco_Sinal_N']   = df_conc['Preco_Sinal'].apply(limpar_numero)
+    df_conc['Referencia_N']    = df_conc['Referencia_Fin'].apply(limpar_numero)
+    df_conc['Dias_Ate_Alvo_N'] = pd.to_numeric(df_conc['Dias_Ate_Alvo'], errors='coerce')
+
+    def roi_realizado(r):
+        if r['Preco_Sinal_N'] <= 0:
+            return 0.0
+        return ((r['Referencia_N'] - r['Preco_Sinal_N']) / r['Preco_Sinal_N']) * 100 * r['Pts']
+
+    df_conc['ROI_Realizado'] = df_conc.apply(roi_realizado, axis=1)
+
+    linhas = []
+    for item_a, grupo in df_conc.groupby('Item'):
+        n = len(grupo)
+        if n < min_sinais:
+            continue
+
+        n_acertos = int(grupo['Pts'].apply(lambda x: x >= 0.5).sum())
+        soma_pts  = grupo['Pts'].sum()
+        taxa_ef, confiante, ev = calcular_taxa_confianca(n, n_acertos, soma_pts)
+
+        dias_validos = grupo['Dias_Ate_Alvo_N'].dropna()
+        dias_medio   = dias_validos.mean() if not dias_validos.empty else float(dias_swing)
+        dias_medio   = max(dias_medio, 0.5)
+
+        roi_medio_pct = grupo['ROI_Realizado'].mean()
+        roi_frac      = roi_medio_pct / 100
+
+        try:
+            retorno_anualizado = ((1 + roi_frac) ** (365 / dias_medio) - 1) * 100
+        except (OverflowError, ZeroDivisionError):
+            retorno_anualizado = 0.0
+
+        peso_confianca = taxa_ef if confiante else taxa_ef * 0.5
+        score = retorno_anualizado * peso_confianca if ev > 0 else 0.0
+
+        linhas.append({
+            "Item":                 item_a,
+            "Taxa_Acerto_%":        round(taxa_ef * 100, 1),
+            "EV_Sinal":             round(ev, 3),
+            "ROI_Medio_%":          round(roi_medio_pct, 2),
+            "Dias_Medio":           round(dias_medio, 2),
+            "Retorno_Anualizado_%": round(retorno_anualizado, 1),
+            "Score":                round(score, 2),
+        })
+
+    df_score = pd.DataFrame(linhas)
+    if df_score.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    soma_score = df_score[df_score['Score'] > 0]['Score'].sum()
+    if soma_score > 0:
+        df_score['Peso_Alocacao_%'] = df_score['Score'].apply(
+            lambda s: round((s / soma_score) * 100, 2) if s > 0 else 0.0
+        )
+    else:
+        df_score['Peso_Alocacao_%'] = 0.0
+
+    return df_score.sort_values(by='Peso_Alocacao_%', ascending=False).reset_index(drop=True)
 
 # ==============================================================================
 # FUNÇÕES DE APOIO E INTELIGÊNCIA
@@ -681,13 +772,13 @@ df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 # MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO + APRENDIZADO POR REFORÇO
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
-headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica"]
+headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica", "Dias_Ate_Alvo"]
 
 try:
     ws_val = sh.worksheet("Validacao_Sinais")
     val_data = ws_val.get_all_values()
 except:
-    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="10000", cols="11")
+    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="10000", cols="12")
     val_data = []
 
 if not val_data or len(val_data) == 0:
@@ -698,6 +789,10 @@ if len(val_data) > 0 and "Estado_RL" not in val_data[0]:
     print("⚠️ Esquema antigo de 10 colunas detectado. Injetando coluna 'Estado_RL' para compatibilidade...")
     df_val = pd.DataFrame(val_data[1:], columns=val_data[0])
     df_val.insert(9, "Estado_RL", "") 
+    df_val = df_val.reindex(columns=headers_val).fillna("")
+elif len(val_data) > 0 and "Dias_Ate_Alvo" not in val_data[0]:
+    print("⚠️ Esquema de 11 colunas detectado. Injetando coluna 'Dias_Ate_Alvo' para compatibilidade...")
+    df_val = pd.DataFrame(val_data[1:], columns=val_data[0])
     df_val = df_val.reindex(columns=headers_val).fillna("")
 else:
     df_val = pd.DataFrame(val_data[1:], columns=val_data[0]) if len(val_data) > 1 else pd.DataFrame(columns=headers_val)
@@ -779,6 +874,28 @@ if not df_val.empty:
             #   0h abaixo  → ❌ FALHOU — preço nunca chegou abaixo da ref, venda foi prematura
             horas_venda = int((df_pos_sinal['Price'] <= ref_fin_v).sum()) if not df_pos_sinal.empty else 0
 
+            # Dias_Ate_Alvo: dia real (dentro da janela de 12) em que a sustentação
+            # de 3h foi atingida pela primeira vez. Não muda QUANDO o sinal conclui
+            # (isso continua esperando 12 dias, por segurança) — só registra QUANDO
+            # a oportunidade real apareceu, para permitir comparação de velocidade
+            # de retorno entre itens (10% em 3 dias vs 10% em 11 dias são diferentes).
+            # Para 🏆/💰: dia da 1ª sustentação. Para ❌/STOP: fica em branco (não aplicável).
+            dias_ate_alvo = None
+            if not df_pos_sinal.empty and pd.notnull(data_sinal_v):
+                if tipo_v == "COMPRA":
+                    qualifica = df_pos_sinal['Price'] >= ref_fin_v
+                elif tipo_v == "VENDA" and "_STOP" not in str(row_val['Chave_Unica']):
+                    qualifica = df_pos_sinal['Price'] <= ref_fin_v
+                else:
+                    qualifica = None
+
+                if qualifica is not None:
+                    cum = qualifica.cumsum()
+                    atingiu = cum[cum >= 3]
+                    if not atingiu.empty:
+                        ts_atingiu = df_pos_sinal.loc[atingiu.index[0], 'Timestamp']
+                        dias_ate_alvo = round((ts_atingiu - data_sinal_v).total_seconds() / 86400, 2)
+
             status_v = "Aguardando"
 
             # --- BLOCO DE VALIDAÇÃO COM SUSTENTAÇÃO DE PREÇO ---
@@ -831,6 +948,12 @@ if not df_val.empty:
             df_val.at[idx, 'Monitoramento_12d'] = round(preco_monitoramento, 4)
             df_val.at[idx, 'Status'] = status_v
 
+            # ❌ FALHOU: capital ficou parado os 12 dias inteiros sem sucesso —
+            # usa DIAS_SWING como tempo de imobilização para a métrica de EV/dia.
+            if "❌" in status_v and dias_ate_alvo is None:
+                dias_ate_alvo = float(DIAS_SWING)
+            df_val.at[idx, 'Dias_Ate_Alvo'] = dias_ate_alvo if dias_ate_alvo is not None else ""
+
             # Se o status foi finalizado AGORA, guardamos para atualizar o RL sem duplicidade
             if "🏆" in status_v or "❌" in status_v or "💰" in status_v:
                 indices_concluidos_neste_ciclo.append(idx)
@@ -841,6 +964,12 @@ if not df_val.empty:
     df_val['Referencia_Fin'] = df_val['Referencia_Fin'].apply(limpar_numero)
     df_val['Monitoramento_12d'] = df_val['Monitoramento_12d'].apply(limpar_numero)
     df_val['Dias_Passados'] = pd.to_numeric(df_val['Dias_Passados'].apply(limpar_numero), errors='coerce').fillna(0).astype(int)
+    # Dias_Ate_Alvo fica vazio ("") quando não aplicável (sinal ainda Aguardando,
+    # ou STOP, que não é um alvo de lucro) — não força para 0, pois 0 teria
+    # significado próprio (sustentação no mesmo ciclo do sinal).
+    df_val['Dias_Ate_Alvo'] = df_val['Dias_Ate_Alvo'].apply(
+        lambda x: round(float(x), 2) if str(x).strip() not in ("", "nan", "None") else ""
+    )
     
     # Isolamento limpo do Estado_RL
     df_val['Estado_RL'] = df_val['Estado_RL'].astype(str).apply(lambda x: x.strip().replace("'", ""))
@@ -849,6 +978,36 @@ if not df_val.empty:
     # Salvar de volta as atualizações estruturadas
     ws_val.clear()
     ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1', value_input_option='USER_ENTERED')
+
+    # ======================================================================
+    # ALOCAÇÃO DE RECURSOS — pesos por item usando taxa Bayesiana + retorno
+    # anualizado (velocidade real de capital via Dias_Ate_Alvo). Fonte:
+    # Validacao_Sinais (cobertura sistemática dos 63 itens, sem viés de
+    # seleção manual que o TradeLog teria).
+    # ======================================================================
+    try:
+        df_alocacao = calcular_alocacao_recursos(df_val, dias_swing=DIAS_SWING, min_sinais=3)
+        if not df_alocacao.empty:
+            try:
+                ws_aloc = sh.worksheet("Alocacao_Recursos")
+            except Exception:
+                ws_aloc = sh.add_worksheet(title="Alocacao_Recursos", rows="200", cols="8")
+                set_frozen(ws_aloc, rows=1)
+                format_cell_range(ws_aloc, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
+
+            ws_aloc.clear()
+            ws_aloc.update(
+                values=[df_alocacao.columns.tolist()] + df_alocacao.values.tolist(),
+                range_name='A1',
+                value_input_option='USER_ENTERED'
+            )
+            top3 = ", ".join(df_alocacao.head(3)['Item'].tolist())
+            print(f"💰 Alocação de Recursos: {len(df_alocacao)} itens com dados suficientes "
+                  f"(min. 3 sinais concluídos) | Top 3: {top3}")
+        else:
+            print("💰 Alocação de Recursos: aguardando sinais concluídos suficientes (mín. 3 por item).")
+    except Exception as e:
+        print(f"⚠️ Erro ao calcular Alocação de Recursos: {e}")
 
     # ======================================================================
     # MOTOR DE APRENDIZADO POR REFORÇO — apenas sinais novos deste ciclo
@@ -1208,7 +1367,8 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                     "Aguardando",
                     0,
                     f"'{estado_rl}",
-                    chave_unica
+                    chave_unica,
+                    ""   # Dias_Ate_Alvo — preenchido na conclusão do sinal
                 ])
                 prox_id_sinal += 1
 
