@@ -346,6 +346,16 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
     def roi_realizado(r):
         if r['Preco_Sinal_N'] <= 0:
             return 0.0
+        # COMPRA: Referencia_Fin é o preço de venda FUTURO ainda não executado —
+        # a taxa de 10% do marketplace ainda vai incidir quando você vender.
+        # Sem descontar aqui, o ROI mostrado é bruto (preço-a-preço) e superestima
+        # o lucro real em ~11 p.p. (ex: alvo de +19% bruto vira +7% líquido real).
+        # VENDA: Referencia_Fin só confirma se a venda JÁ EXECUTADA foi acertada
+        # (preço caiu depois) — a taxa já foi paga no momento real da venda,
+        # não faz sentido descontar de novo aqui.
+        if r['Tipo'] == "COMPRA":
+            venda_liquida = r['Referencia_N'] * (1 - TAXA_MARKETPLACE)
+            return ((venda_liquida - r['Preco_Sinal_N']) / r['Preco_Sinal_N']) * 100 * r['Pts']
         return ((r['Referencia_N'] - r['Preco_Sinal_N']) / r['Preco_Sinal_N']) * 100 * r['Pts']
 
     df_conc['ROI_Realizado'] = df_conc.apply(roi_realizado, axis=1)
