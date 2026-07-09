@@ -996,8 +996,10 @@ if not df_val.empty:
     # Dias_Ate_Alvo fica vazio ("") quando não aplicável (sinal ainda Aguardando,
     # ou STOP, que não é um alvo de lucro) — não força para 0, pois 0 teria
     # significado próprio (sustentação no mesmo ciclo do sinal).
+    # Usa limpar_numero() em vez de float() direto: valores lidos de volta da
+    # planilha vêm como string no formato BR ("3,28"), que float() rejeita.
     df_val['Dias_Ate_Alvo'] = df_val['Dias_Ate_Alvo'].apply(
-        lambda x: round(float(x), 2) if str(x).strip() not in ("", "nan", "None") else ""
+        lambda x: round(limpar_numero(x), 2) if str(x).strip() not in ("", "nan", "None") else ""
     )
     
     # Isolamento limpo do Estado_RL
