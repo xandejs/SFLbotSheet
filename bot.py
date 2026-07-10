@@ -60,7 +60,8 @@ HEADERS_AUDIT = [
 #          e estados com Q muito alto recebem bônus no ROI ajustado.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def calcular_veto_rl(estado_rl, q_table, n_obs_por_estado=None):
+def calcular_veto_rl(estado_rl, q_table, n_obs_por_estado=None,
+                      q_compra_item=None, n_obs_item=0):
     """
     Retorna (vetado: bool, bonus_roi: float).
 
@@ -71,12 +72,37 @@ def calcular_veto_rl(estado_rl, q_table, n_obs_por_estado=None):
     Bônus de exploração:
       - Q_COMPRA > +0.5: adiciona +5% ao ROI ajustado (prioriza estado excelente)
       - Q_COMPRA > +0.7: adiciona +10%
+
+    Q-table híbrida (global + específica por item):
+      O Q-value do Estado_RL é compartilhado entre TODOS os itens que caem
+      nesse mesmo estado discreto (ex: Leather e Kale ambos em "1023100").
+      Isso acelera o aprendizado (mais dados por estado), mas mistura itens
+      com perfis de risco muito diferentes.
+
+      q_compra_item/n_obs_item (opcionais): quando fornecidos, o Q-value final
+      é uma mistura entre o global e o específico do item, com peso crescendo
+      conforme o item acumula seu próprio histórico:
+          peso_item = min(1.0, n_obs_item / 10.0)
+          q_final   = peso_item * q_item + (1 - peso_item) * q_global
+      Um item novo (peso≈0) usa quase 100% do conhecimento global — generaliza
+      rápido. Um item com 10+ observações próprias (peso=1.0) usa seu histórico
+      específico, sem contaminação de outros itens no mesmo estado.
     """
     if estado_rl not in q_table:
+        q_compra_global = 0.0
+    else:
+        q_compra_global = q_table[estado_rl].get("COMPRA", 0.0)
+
+    if q_compra_item is not None:
+        peso_item = min(1.0, n_obs_item / 10.0)
+        q_compra  = peso_item * q_compra_item + (1 - peso_item) * q_compra_global
+    else:
+        q_compra = q_compra_global
+
+    if estado_rl not in q_table and q_compra_item is None:
         return False, 0.0
 
-    q_compra = q_table[estado_rl].get("COMPRA", 0.0)
-    n_obs    = (n_obs_por_estado or {}).get(estado_rl, 0)
+    n_obs = (n_obs_por_estado or {}).get(estado_rl, 0)
 
     # Threshold endurece logaritmicamente com nº de observações
     if n_obs < 5:
@@ -339,6 +365,29 @@ def detectar_regime(d_item, janela_crash_h=24, limiar_queda=-0.12):
     return variacao_24h < limiar_queda, round(variacao_24h * 100, 2)
 
 
+def calcular_roi_real(tipo, preco_sinal, preco_final):
+    """
+    ROI real observado no momento da conclusão de um sinal, usando o preço
+    FINAL efetivamente atingido — não o alvo teórico (Referencia_Fin), nem o
+    máximo/mínimo histórico (Monitoramento_12d). É o mesmo cálculo usado tanto
+    para a recompensa do Cerebro_RL quanto para o ranking de Alocação de
+    Recursos, unificando os dois sistemas de aprendizado do bot.
+
+    COMPRA: Preco_Final é o preço de uma venda futura ainda não executada —
+            desconta a taxa de marketplace, pois ela ainda vai incidir.
+    VENDA/STOP: confirma se a decisão foi validada pela queda de preço após
+                a saída — a taxa já foi paga na venda real, não desconta de novo.
+                Positivo = preço caiu após a saída (decisão validada).
+                Negativo = preço subiu após a saída (saída foi prematura).
+    """
+    if preco_sinal <= 0:
+        return 0.0
+    if tipo == "COMPRA":
+        venda_liquida = preco_final * (1 - TAXA_MARKETPLACE)
+        return ((venda_liquida - preco_sinal) / preco_sinal) * 100
+    return ((preco_sinal - preco_final) / preco_sinal) * 100
+
+
 def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
     """
     Calcula pesos de alocacao de capital por item, combinando taxa de acerto
@@ -370,23 +419,23 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
 
     df_conc['Pts'] = df_conc['Status'].astype(str).apply(pontos)
     df_conc['Preco_Sinal_N']   = df_conc['Preco_Sinal'].apply(limpar_numero)
-    df_conc['Referencia_N']    = df_conc['Referencia_Fin'].apply(limpar_numero)
+    df_conc['Preco_Final_N']   = df_conc['Preco_Final'].apply(limpar_numero)
     df_conc['Dias_Ate_Alvo_N'] = pd.to_numeric(df_conc['Dias_Ate_Alvo'], errors='coerce')
 
     def roi_realizado(r):
+        # Fallback para sinais antigos (schema pré-Preco_Final): usa Referencia_Fin
+        # ponderado por Pts como antes. Sinais novos usam o preço REAL observado —
+        # muito mais fiel, inclusive capturando o tamanho real de uma falha
+        # (uma queda de 15% aparece como -15%, não como um "0" categórico).
+        if r['Preco_Final_N'] > 0:
+            return calcular_roi_real(r['Tipo'], r['Preco_Sinal_N'], r['Preco_Final_N'])
         if r['Preco_Sinal_N'] <= 0:
             return 0.0
-        # COMPRA: Referencia_Fin é o preço de venda FUTURO ainda não executado —
-        # a taxa de 10% do marketplace ainda vai incidir quando você vender.
-        # Sem descontar aqui, o ROI mostrado é bruto (preço-a-preço) e superestima
-        # o lucro real em ~11 p.p. (ex: alvo de +19% bruto vira +7% líquido real).
-        # VENDA: Referencia_Fin só confirma se a venda JÁ EXECUTADA foi acertada
-        # (preço caiu depois) — a taxa já foi paga no momento real da venda,
-        # não faz sentido descontar de novo aqui.
+        ref_n = limpar_numero(r['Referencia_Fin'])
         if r['Tipo'] == "COMPRA":
-            venda_liquida = r['Referencia_N'] * (1 - TAXA_MARKETPLACE)
+            venda_liquida = ref_n * (1 - TAXA_MARKETPLACE)
             return ((venda_liquida - r['Preco_Sinal_N']) / r['Preco_Sinal_N']) * 100 * r['Pts']
-        return ((r['Referencia_N'] - r['Preco_Sinal_N']) / r['Preco_Sinal_N']) * 100 * r['Pts']
+        return ((ref_n - r['Preco_Sinal_N']) / r['Preco_Sinal_N']) * 100 * r['Pts']
 
     df_conc['ROI_Realizado'] = df_conc.apply(roi_realizado, axis=1)
 
@@ -450,6 +499,67 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
 # ==============================================================================
 # FUNÇÕES DE APOIO E INTELIGÊNCIA
 # ==============================================================================
+
+def salvar_aba_atomica(sh, titulo, header, linhas, rows_est=None, cols_est=None, formatar_header=True):
+    """
+    Grava dados numa aba do Google Sheets de forma atômica (parâmetro 6):
+    escreve tudo numa aba temporária primeiro, e só substitui a aba original
+    se a escrita for bem-sucedida.
+
+    Por que isso importa: o padrão anterior (ws.clear() seguido de ws.update())
+    tem uma janela de risco real — se o processo morrer exatamente entre as
+    duas chamadas (timeout do GitHub Actions, queda de rede, erro de quota),
+    a aba fica VAZIA, perdendo todo o histórico. Para Cerebro_RL isso significa
+    apagar meses de aprendizado acumulado; para Validacao_Sinais, anos de
+    sinais e seus resultados reais.
+
+    Com a escrita atômica: se a escrita na aba temporária falhar, a aba
+    original nunca é tocada. Só depois de confirmar que os dados novos estão
+    salvos com sucesso é que a aba antiga é substituída.
+
+    Retorna True se a operação foi bem-sucedida, False caso contrário.
+    """
+    titulo_temp = f"{titulo}_tmp_{int(datetime.now().timestamp())}"
+    n_linhas = len(linhas) + 1
+    n_cols   = len(header)
+    rows_final = str(max(rows_est or 0, n_linhas + 100))
+    cols_final = str(max(cols_est or 0, n_cols))
+
+    ws_temp = None
+    try:
+        ws_temp = sh.add_worksheet(title=titulo_temp, rows=rows_final, cols=cols_final)
+        ws_temp.update(
+            values=[header] + linhas,
+            range_name='A1',
+            value_input_option='USER_ENTERED'
+        )
+        if formatar_header:
+            set_frozen(ws_temp, rows=1)
+            ultima_col = chr(ord('A') + min(n_cols, 26) - 1)
+            format_cell_range(ws_temp, f'A1:{ultima_col}1', CellFormat(textFormat=TextFormat(bold=True)))
+    except Exception as e:
+        print(f"❌ Falha ao escrever aba temporária para '{titulo}': {e} — aba original preservada.")
+        if ws_temp is not None:
+            try:
+                sh.del_worksheet(ws_temp)
+            except Exception:
+                pass
+        return False
+
+    # Escrita temporária confirmada — agora substitui a aba original com segurança
+    try:
+        try:
+            ws_antiga = sh.worksheet(titulo)
+            sh.del_worksheet(ws_antiga)
+        except Exception:
+            pass   # aba original não existia ainda (primeira execução) — normal
+        ws_temp.update_title(titulo)
+        return True
+    except Exception as e:
+        print(f"⚠️ Escrita em '{titulo}' concluída, mas troca de nome falhou: {e}. "
+              f"Dados estão seguros na aba temporária '{titulo_temp}' — verifique manualmente.")
+        return False
+
 
 def obter_agora_brt():
     """Retorna o datetime atual convertido para o Horário de Brasília (BRT),
@@ -540,7 +650,8 @@ def preparar_indicadores(df_original, nome_item):
 
     # Garante que as colunas do modelo existem mesmo se o histórico for curto
     for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro',
-                'Season_Num', 'Lag_1', 'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
+                'Season_Num', 'Lag_1', 'Lag_2', 'Lag_3', 'Hora_Dia', 'Dia_Semana',
+                'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
         d[col] = np.nan
     d['is_holdout'] = False
 
@@ -573,6 +684,16 @@ def preparar_indicadores(df_original, nome_item):
     # --- Features para o XGBoost ---
     d['Season_Num'] = d['Season'].map(MAP_ESTACOES).fillna(0)
     d['Lag_1']       = d['Price'].shift(1)
+    # Lag_2/Lag_3: mais contexto temporal além do preço imediatamente anterior —
+    # ajuda o modelo a distinguir uma reversão de curto prazo de uma continuação
+    # de tendência (Lag_1 sozinho não diferencia isso).
+    d['Lag_2']       = d['Price'].shift(2)
+    d['Lag_3']       = d['Price'].shift(3)
+    # Hora_Dia/Dia_Semana: economias de jogo costumam ter padrão circadiano de
+    # atividade de jogadores (mais oferta/demanda em certos horários e dias),
+    # o que pode afetar picos de preço de forma sistemática e previsível.
+    d['Hora_Dia']    = d['Timestamp'].dt.hour
+    d['Dia_Semana']  = d['Timestamp'].dt.dayofweek
     d['Preco_Futuro']= d['Price'].shift(-SHIFT_ALVO)
 
     # Peso temporal exponencial (dados mais recentes pesam mais)
@@ -581,19 +702,42 @@ def preparar_indicadores(df_original, nome_item):
         lambda x: np.exp(-0.01 * (max_date - x).days)
     )
 
-    # --- HOLDOUT TEMPORAL ---
+    # --- HOLDOUT TEMPORAL COM VALIDAÇÃO CRUZADA (múltiplas janelas) ---
     # Separamos dois conceitos que antes eram confundidos:
     #   SHIFT_ALVO (288) = janela de predição de produção → gera NaN nas últimas 288 linhas
-    #   HOLDOUT_AUDIT (72) = janela de medição de erro → colocada ANTES da zona de NaN
+    #   HOLDOUT_JANELA (72) = tamanho de cada janela de medição de erro
     #
-    # Layout: [Treino][Holdout=72][NaN=288]
-    # Mínimo por item: 120 (warmup) + 50 (treino) + 72 (holdout) + 288 (NaN) = 530 linhas (~22 dias)
-    # Itens com menos de 530 linhas: treinados normalmente, MAE fica em branco (aceitável).
-    HOLDOUT_AUDIT = 72   # 3 dias — suficiente para MAE/RMSE/Acerto_Direcao confiáveis
-    holdout_fim = len(d) - SHIFT_ALVO
-    holdout_ini = holdout_fim - HOLDOUT_AUDIT
-    if holdout_ini > 0:
-        d.iloc[holdout_ini:holdout_fim, d.columns.get_loc('is_holdout')] = True
+    # Uma única janela de 72h pode ser "sortuda" ou "azarada" — cai bem ou mal
+    # dependendo do trecho de mercado que calhou de estar ali. Para reduzir essa
+    # variância, usamos 3 janelas de 72h espalhadas em pontos diferentes do
+    # histórico (não apenas a mais recente), e o MAE/RMSE/Acerto_Direcao final
+    # é calculado sobre a UNIÃO das 3 — uma amostra maior e mais representativa
+    # de diferentes regimes de mercado, não só o que aconteceu nos últimos 3 dias.
+    #
+    # Layout: [Treino][Janela1=72][...][Janela2=72][...][Janela3=72][NaN=288]
+    # Mínimo para 3 janelas: 120 (warmup) + 3×72 (janelas) + 50 (treino) + 288 (NaN)
+    #                       ≈ 674 linhas (~28 dias). Abaixo disso, cai para uma
+    # única janela (como antes, ~22 dias mínimo). Abaixo disso ainda, sem MAE.
+    HOLDOUT_JANELA = 72
+    N_JANELAS_HOLDOUT = 3
+    WARMUP_MACRO = 120   # mesmo mínimo usado no rolling da Media_Macro
+
+    zona_fim = len(d) - SHIFT_ALVO          # início da zona de NaN (Preco_Futuro)
+    zona_disponivel = zona_fim - WARMUP_MACRO
+
+    if zona_disponivel >= (N_JANELAS_HOLDOUT * HOLDOUT_JANELA + 50):
+        tamanho_segmento = zona_disponivel // N_JANELAS_HOLDOUT
+        for i in range(N_JANELAS_HOLDOUT):
+            seg_fim = WARMUP_MACRO + tamanho_segmento * (i + 1)
+            seg_ini = max(WARMUP_MACRO, seg_fim - HOLDOUT_JANELA)
+            if seg_fim <= zona_fim:
+                d.iloc[seg_ini:seg_fim, d.columns.get_loc('is_holdout')] = True
+    else:
+        # Fallback: dados insuficientes para 3 janelas — usa 1 única janela,
+        # mantendo o comportamento original para itens com histórico mais curto.
+        holdout_ini = zona_fim - HOLDOUT_JANELA
+        if holdout_ini > WARMUP_MACRO:
+            d.iloc[holdout_ini:zona_fim, d.columns.get_loc('is_holdout')] = True
 
     return d
 
@@ -829,13 +973,13 @@ df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 # MOTOR DE VALIDAÇÃO E AUTOAJUSTE HÍBRIDO + APRENDIZADO POR REFORÇO
 # ==============================================================================
 print("🔄 Processando Validação de Sinais e Métricas de Rigor...")
-headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica", "Dias_Ate_Alvo"]
+headers_val = ["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin", "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica", "Dias_Ate_Alvo", "Preco_Final"]
 
 try:
     ws_val = sh.worksheet("Validacao_Sinais")
     val_data = ws_val.get_all_values()
 except:
-    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="10000", cols="12")
+    ws_val = sh.add_worksheet(title="Validacao_Sinais", rows="10000", cols="13")
     val_data = []
 
 if not val_data or len(val_data) == 0:
@@ -849,6 +993,10 @@ if len(val_data) > 0 and "Estado_RL" not in val_data[0]:
     df_val = df_val.reindex(columns=headers_val).fillna("")
 elif len(val_data) > 0 and "Dias_Ate_Alvo" not in val_data[0]:
     print("⚠️ Esquema de 11 colunas detectado. Injetando coluna 'Dias_Ate_Alvo' para compatibilidade...")
+    df_val = pd.DataFrame(val_data[1:], columns=val_data[0])
+    df_val = df_val.reindex(columns=headers_val).fillna("")
+elif len(val_data) > 0 and "Preco_Final" not in val_data[0]:
+    print("⚠️ Esquema de 12 colunas detectado. Injetando coluna 'Preco_Final' para compatibilidade...")
     df_val = pd.DataFrame(val_data[1:], columns=val_data[0])
     df_val = df_val.reindex(columns=headers_val).fillna("")
 else:
@@ -895,6 +1043,37 @@ except Exception as e:
         print("🧠 Nova aba Cerebro_RL criada com estrutura de 7 caracteres.")
     except:
         print("⚠️ Aba Cerebro_RL já existente, mas vazia ou inacessível.")
+
+# ======================================================================
+# Q-TABLE ESPECÍFICA POR ITEM (Cerebro_RL_Item) — parâmetro adaptativo 3
+# Complementa (não substitui) a q_table global. Chave = "Item|Estado_RL".
+# Usada em calcular_veto_rl() para misturar o conhecimento global (rápido
+# de generalizar) com o específico do item (mais preciso, mas exige mais
+# dados próprios). Ver docstring de calcular_veto_rl para a fórmula de blend.
+# ======================================================================
+q_table_item = {}
+
+try:
+    ws_cerebro_item = sh.worksheet("Cerebro_RL_Item")
+    cerebro_item_data = ws_cerebro_item.get_all_values()
+    if len(cerebro_item_data) > 1:
+        for row in cerebro_item_data[1:]:
+            if len(row) >= 3:
+                chave_ci = str(row[0]).strip().replace("'", "")
+                q_table_item[chave_ci] = {
+                    "COMPRA":   limpar_numero(row[1]),
+                    "VENDA":    limpar_numero(row[2]),
+                    "N_COMPRA": int(limpar_numero(row[3])) if len(row) > 3 else 0,
+                    "N_VENDA":  int(limpar_numero(row[4])) if len(row) > 4 else 0,
+                }
+        print(f"🧠 Cérebro RL (item-específico) carregado: {len(q_table_item)} combinações item|estado.")
+except Exception:
+    try:
+        ws_cerebro_item = sh.add_worksheet(title="Cerebro_RL_Item", rows="20000", cols="5")
+        ws_cerebro_item.update(values=[["Item_Estado", "Q_COMPRA", "Q_VENDA", "N_COMPRA", "N_VENDA"]], range_name='A1', value_input_option='USER_ENTERED')
+        print("🧠 Nova aba Cerebro_RL_Item criada.")
+    except:
+        print("⚠️ Aba Cerebro_RL_Item já existente, mas vazia ou inacessível.")
 
 # Lista para capturar APENAS os índices que mudaram de estado NESTE ciclo específico
 indices_concluidos_neste_ciclo = []
@@ -1033,6 +1212,16 @@ if not df_val.empty:
                 dias_ate_alvo = float(dias_p)
             df_val.at[idx, 'Dias_Ate_Alvo'] = dias_ate_alvo if dias_ate_alvo is not None else ""
 
+            # Preco_Final: preço REAL observado no momento da conclusão (última
+            # linha do histórico filtrado), não o alvo teórico nem o máximo/mínimo.
+            # Base para o ROI unificado usado tanto no Cerebro_RL quanto na
+            # Alocação de Recursos — reflete o que aconteceu de verdade, inclusive
+            # o tamanho real de uma falha (não apenas "0" categórico).
+            if status_v not in ("Aguardando",) and not df_pos_sinal.empty:
+                df_val.at[idx, 'Preco_Final'] = round(df_pos_sinal['Price'].iloc[-1], 4)
+            elif status_v not in ("Aguardando",):
+                df_val.at[idx, 'Preco_Final'] = round(preco_sinal_v, 4)
+
             # Se o status foi finalizado AGORA, guardamos para atualizar o RL sem duplicidade
             if "🏆" in status_v or "❌" in status_v or "💰" in status_v:
                 indices_concluidos_neste_ciclo.append(idx)
@@ -1049,14 +1238,25 @@ if not df_val.empty:
     df_val['Dias_Ate_Alvo'] = df_val['Dias_Ate_Alvo'].apply(
         lambda x: round(limpar_numero(x), 2) if str(x).strip() not in ("", "nan", "None") else ""
     )
+    # Preco_Final: mesmo padrão — vazio quando ainda Aguardando, número quando concluído.
+    df_val['Preco_Final'] = df_val['Preco_Final'].apply(
+        lambda x: round(limpar_numero(x), 4) if str(x).strip() not in ("", "nan", "None") else ""
+    )
     
     # Isolamento limpo do Estado_RL
     df_val['Estado_RL'] = df_val['Estado_RL'].astype(str).apply(lambda x: x.strip().replace("'", ""))
     df_val['Estado_RL'] = df_val['Estado_RL'].apply(lambda x: f"'{x}" if x != "" else "")
 
-    # Salvar de volta as atualizações estruturadas
-    ws_val.clear()
-    ws_val.update(values=([headers_val] + df_val.values.tolist()), range_name='A1', value_input_option='USER_ENTERED')
+    # Salvar de volta as atualizações estruturadas — escrita atômica (parâmetro 6):
+    # aba temporária primeiro, só substitui a original se a escrita for confirmada.
+    ok_val = salvar_aba_atomica(
+        sh, "Validacao_Sinais", headers_val, df_val.values.tolist(),
+        rows_est=10000, cols_est=len(headers_val)
+    )
+    if ok_val:
+        ws_val = sh.worksheet("Validacao_Sinais")   # referência atualizada após o rename
+    else:
+        print("⚠️ Validacao_Sinais não foi atualizada neste ciclo — dados anteriores preservados.")
 
     # ======================================================================
     # ALOCAÇÃO DE RECURSOS — pesos por item usando taxa Bayesiana + retorno
@@ -1101,7 +1301,21 @@ if not df_val.empty:
             acao_rl   = row_r['Tipo']
             status_rl = row_r['Status']
 
-            if status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
+            # Recompensa contínua via ROI real (mesma calcular_roi_real usada na
+            # Alocação de Recursos) — substitui a categórica 1.0/0.5/-1.0.
+            # Um acerto de 25% de lucro agora vale mais que um de 7%; uma falha
+            # que só perdeu 2% pesa menos que uma que perdeu 20% — antes as duas
+            # eram idênticas (-1.0). Normalizado pelo LUCRO_REAL_DESEJADO (7%)
+            # para manter a escala comparável ao sistema categórico anterior
+            # (bater exatamente a meta de 7% ainda dá recompensa ~1.0).
+            preco_sinal_r = limpar_numero(row_r['Preco_Sinal'])
+            preco_final_r = limpar_numero(row_r['Preco_Final'])
+
+            if preco_final_r > 0:
+                roi_real_pct = calcular_roi_real(acao_rl, preco_sinal_r, preco_final_r)
+                recompensa = max(-2.0, min(2.0, roi_real_pct / (LUCRO_REAL_DESEJADO * 100)))
+            # Fallback categórico para sinais antigos sem Preco_Final (schema pré-migração)
+            elif status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
                 recompensa = 1.0
             elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL", "💰 LUCRO PARCIAL (SPIKE)"]:
                 recompensa = 0.5
@@ -1124,9 +1338,25 @@ if not df_val.empty:
             q_table[st_rl][acao_rl] = q_atual + alpha_dinamico * (recompensa - q_atual)
             q_table[st_rl][chave_n] = n_visitas
 
+            # Atualização espelhada na Q-table item-específica (parâmetro 3).
+            # Mesma recompensa, mesmo mecanismo de alpha decrescente, mas com
+            # contador de visitas PRÓPRIO do item — assim itens raros continuam
+            # de fato "sem histórico próprio" (peso_item baixo em calcular_veto_rl)
+            # mesmo que o estado global já tenha muitas observações de outros itens.
+            chave_item_estado = f"{row_r['Item']}|{st_rl}"
+            if chave_item_estado not in q_table_item:
+                q_table_item[chave_item_estado] = {"COMPRA": 0.0, "VENDA": 0.0, "N_COMPRA": 0, "N_VENDA": 0}
+
+            n_visitas_item = q_table_item[chave_item_estado].get(chave_n, 0) + 1
+            alpha_item     = max(ALPHA_MINIMO, 1.0 / (1 + n_visitas_item))
+            q_atual_item   = q_table_item[chave_item_estado].get(acao_rl, 0.0)
+            q_table_item[chave_item_estado][acao_rl] = q_atual_item + alpha_item * (recompensa - q_atual_item)
+            q_table_item[chave_item_estado][chave_n] = n_visitas_item
+
         print(f"🧠 Cérebro RL Atualizado de forma incremental: {len(df_reforco)} novos estados processados.")
 
-    print(f"🧠 Cérebro RL Atualizado internamente: {len(q_table)} estados de mercado na memória RAM.")
+    print(f"🧠 Cérebro RL Atualizado internamente: {len(q_table)} estados globais | "
+          f"{len(q_table_item)} combinações item|estado na memória RAM.")
 
 try:
     max_id_existente = int(pd.to_numeric(df_val['ID_Sinal'], errors='coerce').max()) if not df_val.empty else 0
@@ -1181,7 +1411,8 @@ except Exception:
 cache_indicadores = {}
 ranking = []
 audit_linhas = []   # acumula métricas para gravar na aba XGB_Audit ao final
-X_cols = ['Price', 'Lag_1', 'RSI_Micro', 'Media_Macro', 'Desvio_Macro', 'Season_Num']
+X_cols = ['Price', 'Lag_1', 'Lag_2', 'Lag_3', 'RSI_Micro', 'Media_Macro',
+          'Desvio_Macro', 'Season_Num', 'Hora_Dia', 'Dia_Semana']
 
 for item in df_bruto['Item'].unique():
     try:
@@ -1357,11 +1588,20 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
     if acao == "🟢 COMPRAR" and mapa_veto.get(item, False):
         acao = "🚫 COMPRA VETADA"
 
-    # Veto RL adaptativo (item 1): threshold endurece com nº de observações
-    # do estado, e estados com Q_COMPRA alto recebem bônus no ROI exibido.
+    # Veto RL adaptativo (item 1) + Q-table híbrida (item 3): threshold endurece
+    # com nº de observações do estado, e o Q-value usado é uma mistura entre o
+    # global (rápido de generalizar) e o específico do item (mais preciso).
     roi_pred_exibido = roi_pred
     if acao == "🟢 COMPRAR":
-        vetado_rl, bonus_roi_rl = calcular_veto_rl(estado_rl, q_table, n_obs_rl_map)
+        chave_ci_atual = f"{item}|{estado_rl}"
+        q_item_dados   = q_table_item.get(chave_ci_atual, {})
+        q_compra_item  = q_item_dados.get("COMPRA")
+        n_obs_item_at  = q_item_dados.get("N_COMPRA", 0)
+
+        vetado_rl, bonus_roi_rl = calcular_veto_rl(
+            estado_rl, q_table, n_obs_rl_map,
+            q_compra_item=q_compra_item, n_obs_item=n_obs_item_at
+        )
         roi_pred_exibido = roi_pred + bonus_roi_rl
         if vetado_rl:
             acao = "🚫 VETO DO CÉREBRO RL (Histórico de Prejuízo)"
@@ -1457,7 +1697,8 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                     0,
                     f"'{estado_rl}",
                     chave_unica,
-                    ""   # Dias_Ate_Alvo — preenchido na conclusão do sinal
+                    "",  # Dias_Ate_Alvo — preenchido na conclusão do sinal
+                    ""   # Preco_Final — preenchido na conclusão do sinal
                 ])
                 prox_id_sinal += 1
 
@@ -1556,10 +1797,7 @@ except Exception as e:
 # PERSISTÊNCIA DO CÉREBRO RL (GRAVAÇÃO E SINCRONIZAÇÃO DA Q-TABLE)
 # ==============================================================================
 try:
-    ws_cerebro = sh.worksheet("Cerebro_RL")
-    ws_cerebro.clear()
-    
-    cerebro_linhas = [["Estado_RL", "Q_COMPRA", "Q_VENDA", "N_COMPRA", "N_VENDA"]]
+    cerebro_linhas = []
     for st, acoes in q_table.items():
         cerebro_linhas.append([
             f"'{st}", 
@@ -1568,12 +1806,47 @@ try:
             int(acoes.get("N_COMPRA", 0)),
             int(acoes.get("N_VENDA", 0))
         ])
-        
-    ws_cerebro.update(values=cerebro_linhas, range_name='A1', value_input_option='USER_ENTERED')
-    set_frozen(ws_cerebro, rows=1)
-    format_cell_range(ws_cerebro, 'A1:E1', CellFormat(textFormat=TextFormat(bold=True)))
-    print("✅ Memória de Longo Prazo (Cerebro_RL) sincronizada!")
+
+    # Escrita atômica (parâmetro 6): este é o dado mais crítico de todo o
+    # sistema — meses de aprendizado acumulado. Uma escrita comum (clear+update)
+    # que morre no meio zera a memória inteira. Aqui, só substitui a aba
+    # original depois de confirmar que os novos dados foram gravados com êxito.
+    ok_cerebro = salvar_aba_atomica(
+        sh, "Cerebro_RL",
+        ["Estado_RL", "Q_COMPRA", "Q_VENDA", "N_COMPRA", "N_VENDA"],
+        cerebro_linhas, rows_est=5000, cols_est=5
+    )
+    if ok_cerebro:
+        print("✅ Memória de Longo Prazo (Cerebro_RL) sincronizada com segurança!")
+    else:
+        print("⚠️ Cerebro_RL não foi atualizado neste ciclo — estado anterior preservado.")
 except Exception as e:
     print(f"❌ Erro ao salvar a Q-Table em Cerebro_RL: {e}")
+
+# ==============================================================================
+# PERSISTÊNCIA DA Q-TABLE ITEM-ESPECÍFICA (Cerebro_RL_Item)
+# ==============================================================================
+try:
+    cerebro_item_linhas = []
+    for chave_ci, acoes in q_table_item.items():
+        cerebro_item_linhas.append([
+            f"'{chave_ci}",
+            round(acoes.get("COMPRA", 0.0), 4),
+            round(acoes.get("VENDA", 0.0), 4),
+            int(acoes.get("N_COMPRA", 0)),
+            int(acoes.get("N_VENDA", 0))
+        ])
+
+    ok_cerebro_item = salvar_aba_atomica(
+        sh, "Cerebro_RL_Item",
+        ["Item_Estado", "Q_COMPRA", "Q_VENDA", "N_COMPRA", "N_VENDA"],
+        cerebro_item_linhas, rows_est=20000, cols_est=5
+    )
+    if ok_cerebro_item:
+        print("✅ Cerebro_RL_Item sincronizado com segurança!")
+    else:
+        print("⚠️ Cerebro_RL_Item não foi atualizado neste ciclo — estado anterior preservado.")
+except Exception as e:
+    print(f"❌ Erro ao salvar Cerebro_RL_Item: {e}")
 
 print("🏁 Ciclo finalizado com sucesso!")
