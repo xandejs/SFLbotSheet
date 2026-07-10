@@ -155,6 +155,29 @@ def calcular_taxa_confianca(n_total, n_acertos, soma_recompensas,
     return taxa_efetiva, confiante, ev_esperado
 
 
+def calcular_prior_empirico(df_conc, forca_prior=4.0):
+    """
+    Retorna (prior_a, prior_b) calibrados pela taxa de acerto GLOBAL do mercado
+    (todos os itens combinados), em vez do neutro 50/50 fixo (Beta(1,1)).
+
+    Por que isso importa: um item novo com apenas 2 sinais concluídos herdava
+    um prior "chute de moeda" (50%) mesmo que o mercado como um todo tivesse,
+    digamos, 65% de acerto médio — subestimando itens novos sistematicamente.
+    Com o prior empírico, itens com pouco histórico herdam o comportamento
+    médio real do mercado até acumularem dados próprios suficientes.
+
+    forca_prior=4.0: equivale a "4 sinais fantasmas" do prior — fraco o
+    bastante para ser dominado rapidamente por dados reais do item (a partir
+    de ~8-10 sinais reais, o prior já tem influência mínima).
+    """
+    if df_conc is None or df_conc.empty:
+        return 1.0, 1.0
+    taxa_global = df_conc['Pts'].apply(lambda x: x >= 0.5).mean()
+    prior_a = max(forca_prior * taxa_global, 0.5)
+    prior_b = max(forca_prior * (1 - taxa_global), 0.5)
+    return prior_a, prior_b
+
+
 def calibrar_por_taxa_confianca(sh, df_val_mem, mapa_mult, mapa_roi, mapa_veto):
     """
     Recalibra os mapas usando taxa Bayesiana em vez do threshold fixo de 45%.
@@ -175,12 +198,19 @@ def calibrar_por_taxa_confianca(sh, df_val_mem, mapa_mult, mapa_roi, mapa_veto):
 
     df_conc['Pts'] = df_conc['Status'].apply(pontos)
 
+    # Prior empírico calculado uma vez, a partir da taxa de acerto global —
+    # substitui o Beta(1,1) neutro no calcular_taxa_confianca para todos os itens.
+    prior_a_global, prior_b_global = calcular_prior_empirico(df_conc)
+
     for item_c, grupo in df_conc.groupby('Item'):
         n        = len(grupo)
         n_acertos = int(grupo['Pts'].apply(lambda x: x >= 0.5).sum())
         soma_pts  = grupo['Pts'].sum()
 
-        taxa_ef, confiante, ev = calcular_taxa_confianca(n, n_acertos, soma_pts)
+        taxa_ef, confiante, ev = calcular_taxa_confianca(
+            n, n_acertos, soma_pts,
+            prior_a=prior_a_global, prior_b=prior_b_global
+        )
 
         # EV esperado > 0.3 = lucrativo em média; < 0 = capital em risco
         if not confiante:
@@ -360,6 +390,11 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
 
     df_conc['ROI_Realizado'] = df_conc.apply(roi_realizado, axis=1)
 
+    # Mesmo prior empírico usado em calibrar_por_taxa_confianca — garante que
+    # os dois sistemas de calibração (mapas de risco e alocação de capital)
+    # tratem itens com pouco histórico de forma consistente entre si.
+    prior_a_global, prior_b_global = calcular_prior_empirico(df_conc)
+
     linhas = []
     for item_a, grupo in df_conc.groupby('Item'):
         n = len(grupo)
@@ -368,7 +403,10 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
 
         n_acertos = int(grupo['Pts'].apply(lambda x: x >= 0.5).sum())
         soma_pts  = grupo['Pts'].sum()
-        taxa_ef, confiante, ev = calcular_taxa_confianca(n, n_acertos, soma_pts)
+        taxa_ef, confiante, ev = calcular_taxa_confianca(
+            n, n_acertos, soma_pts,
+            prior_a=prior_a_global, prior_b=prior_b_global
+        )
 
         dias_validos = grupo['Dias_Ate_Alvo_N'].dropna()
         dias_medio   = dias_validos.mean() if not dias_validos.empty else float(dias_swing)
@@ -464,11 +502,9 @@ def limpar_numero(texto):
     try: return float(s)
     except: return 0.0
 
-def calcular_fifo_hibrido(sh, inventario_dict):
+def calcular_fifo_hibrido(df_trade_raw, inventario_dict):
     try:
-        ws = sh.worksheet("TradeLog")
-        log_data = ws.get_all_values()
-        df_log = pd.DataFrame(log_data[1:], columns=log_data[0])
+        df_log = df_trade_raw.copy()
         df_log['Qtd'] = df_log['Qtd'].apply(limpar_numero)
         df_log['SFL_Total'] = df_log['SFL'].apply(limpar_numero).abs()
         df_compras = df_log[df_log['Tipo'].str.contains("Compra", case=False)].copy()
@@ -777,10 +813,12 @@ sh = gc.open(NOME_PLANILHA)
 inv_data = sh.worksheet("Inventario").get_all_values()
 inv_dict = {row[0]: limpar_numero(row[1]) for row in inv_data[1:]}
 
-mapa_custo_fifo = calcular_fifo_hibrido(sh, inv_dict)
+# TradeLog lido UMA vez só — antes era buscado 2x (aqui e dentro de calcular_fifo_hibrido),
+# consumindo uma chamada de API extra por ciclo sem necessidade.
 trade_data = sh.worksheet("TradeLog").get_all_values()
 df_trade = pd.DataFrame(trade_data[1:], columns=trade_data[0])
 compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].groupby('Nome do Item')['Qtd'].apply(lambda x: sum(map(limpar_numero, x))).to_dict()
+mapa_custo_fifo = calcular_fifo_hibrido(df_trade, inv_dict)
 
 # Carregamento inicial do histórico de preços brutos
 rec_data = sh.worksheet("RecLog").get_all_values()[1:]
@@ -823,25 +861,37 @@ mapa_ajuste_roi  = {}
 # ======================================================================
 # PERSISTÊNCIA DO CÉREBRO RL (CARREGAMENTO DO HISTÓRICO)
 # ======================================================================
-q_table = {}  
-alpha_rl = 0.2  
+q_table = {}
+# alpha_rl agora é a taxa MÁXIMA (usada para estados novos). A taxa real usada
+# em cada atualização decai com o número de visitas: alpha = 1/(1+n_visitas),
+# com piso em 0.05 para não travar completamente e ainda reagir a mudanças
+# genuínas de regime. Alpha fixo em 0.2 nunca convergia de fato — cada novo
+# sinal seguia empurrando o Q-value na mesma proporção, mesmo após 50 observações.
+alpha_rl = 0.2
+ALPHA_MINIMO = 0.05
 
 try:
     ws_cerebro = sh.worksheet("Cerebro_RL")
     cerebro_data = ws_cerebro.get_all_values()
     if len(cerebro_data) > 1:
+        tem_contadores = len(cerebro_data[0]) >= 5   # esquema novo com N_COMPRA/N_VENDA
         for row in cerebro_data[1:]:
             if len(row) >= 3:
                 st = str(row[0]).strip().replace("'", "")
                 q_table[st] = {
                     "COMPRA": limpar_numero(row[1]),
-                    "VENDA": limpar_numero(row[2])
+                    "VENDA":  limpar_numero(row[2]),
+                    # Migração segura: planilhas antigas (3 colunas) começam com
+                    # contador 0 — o alpha decai a partir daqui em diante, sem
+                    # perder os Q-values já aprendidos.
+                    "N_COMPRA": int(limpar_numero(row[3])) if tem_contadores and len(row) > 3 else 0,
+                    "N_VENDA":  int(limpar_numero(row[4])) if tem_contadores and len(row) > 4 else 0,
                 }
         print(f"🧠 Cérebro RL carregado com sucesso: {len(q_table)} estados restaurados da planilha.")
 except Exception as e:
     try:
-        ws_cerebro = sh.add_worksheet(title="Cerebro_RL", rows="5000", cols="3")
-        ws_cerebro.update(values=[["Estado_RL", "Q_COMPRA", "Q_VENDA"]], range_name='A1', value_input_option='USER_ENTERED')
+        ws_cerebro = sh.add_worksheet(title="Cerebro_RL", rows="5000", cols="5")
+        ws_cerebro.update(values=[["Estado_RL", "Q_COMPRA", "Q_VENDA", "N_COMPRA", "N_VENDA"]], range_name='A1', value_input_option='USER_ENTERED')
         print("🧠 Nova aba Cerebro_RL criada com estrutura de 7 caracteres.")
     except:
         print("⚠️ Aba Cerebro_RL já existente, mas vazia ou inacessível.")
@@ -996,8 +1046,6 @@ if not df_val.empty:
     # Dias_Ate_Alvo fica vazio ("") quando não aplicável (sinal ainda Aguardando,
     # ou STOP, que não é um alvo de lucro) — não força para 0, pois 0 teria
     # significado próprio (sustentação no mesmo ciclo do sinal).
-    # Usa limpar_numero() em vez de float() direto: valores lidos de volta da
-    # planilha vêm como string no formato BR ("3,28"), que float() rejeita.
     df_val['Dias_Ate_Alvo'] = df_val['Dias_Ate_Alvo'].apply(
         lambda x: round(limpar_numero(x), 2) if str(x).strip() not in ("", "nan", "None") else ""
     )
@@ -1061,10 +1109,20 @@ if not df_val.empty:
                 recompensa = -1.0
 
             if st_rl not in q_table:
-                q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0}
+                q_table[st_rl] = {"COMPRA": 0.0, "VENDA": 0.0, "N_COMPRA": 0, "N_VENDA": 0}
+
+            chave_n = f"N_{acao_rl}"
+            n_visitas = q_table[st_rl].get(chave_n, 0) + 1
+
+            # Alpha decai com o número de visitas — early sinais movem o Q-value
+            # com força total, mas após dezenas de observações a taxa converge
+            # para o piso (0.05), estabilizando o valor em vez de oscilar
+            # indefinidamente com o ruído da última amostra.
+            alpha_dinamico = max(ALPHA_MINIMO, 1.0 / (1 + n_visitas))
 
             q_atual = q_table[st_rl].get(acao_rl, 0.0)
-            q_table[st_rl][acao_rl] = q_atual + alpha_rl * (recompensa - q_atual)
+            q_table[st_rl][acao_rl] = q_atual + alpha_dinamico * (recompensa - q_atual)
+            q_table[st_rl][chave_n] = n_visitas
 
         print(f"🧠 Cérebro RL Atualizado de forma incremental: {len(df_reforco)} novos estados processados.")
 
@@ -1501,17 +1559,19 @@ try:
     ws_cerebro = sh.worksheet("Cerebro_RL")
     ws_cerebro.clear()
     
-    cerebro_linhas = [["Estado_RL", "Q_COMPRA", "Q_VENDA"]]
+    cerebro_linhas = [["Estado_RL", "Q_COMPRA", "Q_VENDA", "N_COMPRA", "N_VENDA"]]
     for st, acoes in q_table.items():
         cerebro_linhas.append([
             f"'{st}", 
             round(acoes.get("COMPRA", 0.0), 4), 
-            round(acoes.get("VENDA", 0.0), 4)
+            round(acoes.get("VENDA", 0.0), 4),
+            int(acoes.get("N_COMPRA", 0)),
+            int(acoes.get("N_VENDA", 0))
         ])
         
     ws_cerebro.update(values=cerebro_linhas, range_name='A1', value_input_option='USER_ENTERED')
     set_frozen(ws_cerebro, rows=1)
-    format_cell_range(ws_cerebro, 'A1:C1', CellFormat(textFormat=TextFormat(bold=True)))
+    format_cell_range(ws_cerebro, 'A1:E1', CellFormat(textFormat=TextFormat(bold=True)))
     print("✅ Memória de Longo Prazo (Cerebro_RL) sincronizada!")
 except Exception as e:
     print(f"❌ Erro ao salvar a Q-Table em Cerebro_RL: {e}")
