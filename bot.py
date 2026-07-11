@@ -1826,48 +1826,31 @@ except Exception as e:
 # 4b. GRAVAÇÃO DA AUDITORIA DO XGBOOST (XGB_Audit)
 # ==============================================================================
 try:
-    try:
-        ws_audit = sh.worksheet("XGB_Audit")
-    except Exception:
-        n_itens_init = df_bruto['Item'].nunique()
-        rows_init    = n_itens_init * 72 * 2 + 500   # teto inicial + folga
-        ws_audit = sh.add_worksheet(title="XGB_Audit", rows=str(rows_init), cols="8")
-        ws_audit.update(
-            values=[HEADERS_AUDIT],
-            range_name='A1',
-            value_input_option='USER_ENTERED'
-        )
-        set_frozen(ws_audit, rows=1)
-        format_cell_range(
-            ws_audit, 'A1:H1',
-            CellFormat(textFormat=TextFormat(bold=True))
-        )
-        print(f"📊 Aba XGB_Audit criada com {rows_init} linhas ({n_itens_init} itens detectados).")
-
-    # Rotação automática com teto dinâmico.
-    # Recalcula a cada ciclo com base nos itens únicos reais do RecLog —
-    # se novos itens forem adicionados ao jogo, o limite se ajusta sozinho.
-    JANELA_AUDIT_H  = 72                              # horas de histórico útil
-    n_itens_reais   = df_bruto['Item'].nunique()      # cresce automaticamente
-    RETENCAO_AUDIT  = n_itens_reais * JANELA_AUDIT_H * 2  # 2× margem de segurança
+    JANELA_AUDIT_H  = 72
+    n_itens_reais   = df_bruto['Item'].nunique()
+    RETENCAO_AUDIT  = n_itens_reais * JANELA_AUDIT_H * 2
 
     if audit_linhas:
-        dados_atuais = ws_audit.get_all_values()
-        header = dados_atuais[0] if dados_atuais else HEADERS_AUDIT
-        linhas_existentes = dados_atuais[1:] if len(dados_atuais) > 1 else []
+        try:
+            ws_audit_leitura  = sh.worksheet("XGB_Audit")
+            dados_atuais      = ws_audit_leitura.get_all_values()
+            linhas_existentes = dados_atuais[1:] if len(dados_atuais) > 1 else []
+        except Exception:
+            linhas_existentes = []   # aba ainda não existe — primeira execução
 
         todas = linhas_existentes + audit_linhas
         if len(todas) > RETENCAO_AUDIT:
             todas = todas[-RETENCAO_AUDIT:]
 
-        ws_audit.clear()
-        ws_audit.update(
-            values=([header] + todas),
-            range_name='A1',
-            value_input_option='USER_ENTERED'
+        ok_audit = salvar_aba_atomica(
+            sh, "XGB_Audit", HEADERS_AUDIT, todas,
+            rows_est=RETENCAO_AUDIT + 500, cols_est=8
         )
-        print(f"📊 XGB_Audit: {len(audit_linhas)} novos | {len(todas)} retidos | "
-              f"teto={RETENCAO_AUDIT} ({n_itens_reais} itens × {JANELA_AUDIT_H*2}h).")
+        if ok_audit:
+            print(f"📊 XGB_Audit: {len(audit_linhas)} novos | {len(todas)} retidos | "
+                  f"teto={RETENCAO_AUDIT} ({n_itens_reais} itens × {JANELA_AUDIT_H*2}h).")
+        else:
+            print("⚠️ XGB_Audit não foi atualizada neste ciclo — dados anteriores preservados.")
     else:
         print("📊 XGB_Audit: nenhum item com dados suficientes para auditoria.")
 
