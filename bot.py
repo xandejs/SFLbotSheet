@@ -308,6 +308,42 @@ def calcular_stop_adaptativo(item, preco_atual, roi_pred,
 # Solução: margem = fração fixa da largura da banda de Bollinger.
 # ──────────────────────────────────────────────────────────────────────────────
 
+def calcular_hiperparametros_xgb(d_treino, cv_baixo=0.03, cv_alto=0.10):
+    """
+    Ajusta n_estimators/max_depth por tier de volatilidade do item, em vez de
+    usar os mesmos hiperparâmetros fixos para os 63 itens.
+
+    Volatilidade = coeficiente de variação médio no período de treino
+    (Desvio_Macro / Media_Macro) — mesma métrica já usada em detectar_regime
+    e na discretização do Estado_RL, mantendo consistência entre os módulos.
+
+    Baixa volatilidade (ex: Potato, Rhubarb — preço quase flat):
+        menos árvores e menor profundidade. Com pouco sinal real de
+        variação, uma árvore mais complexa aprende ruído, não padrão.
+
+    Alta volatilidade (ex: Obsidian, Moonfur, Crimstone):
+        mais árvores e profundidade extra. Há mais estrutura real no
+        movimento de preço para o modelo capturar, e overfit em ruído
+        é proporcionalmente menos provável quando o sinal é mais forte.
+
+    Retorna (n_estimators, max_depth). Em caso de dados insuficientes
+    para calcular o CV, retorna o default atual (40, 3) como fallback seguro.
+    """
+    if 'Desvio_Macro' not in d_treino or 'Media_Macro' not in d_treino:
+        return 40, 3
+
+    cv = (d_treino['Desvio_Macro'] / d_treino['Media_Macro'].replace(0, np.nan)).mean()
+    if pd.isna(cv):
+        return 40, 3
+
+    if cv < cv_baixo:
+        return 25, 2
+    elif cv < cv_alto:
+        return 40, 3
+    else:
+        return 60, 4
+
+
 def calcular_margem_atencao(alvo_in, alvo_out, fracao=0.15,
                              minimo_abs=0.0001, maximo_pct=0.10):
     """
@@ -636,7 +672,30 @@ def calcular_fifo_hibrido(df_trade_raw, inventario_dict):
     except Exception as e:
         print(f"Erro FIFO: {e}"); return {}
 
-def preparar_indicadores(df_original, nome_item):
+def calcular_indice_mercado(df_bruto_local):
+    """
+    Índice agregado de momentum do mercado inteiro (item 6 dos parâmetros
+    adaptativos) — variação % média de preço, por hora, através de TODOS
+    os itens do RecLog. Captura choques que afetam o jogo inteiro (eventos
+    sazonais, atualizações de conteúdo, mudanças de mecânica) que nenhum
+    item sozinho consegue sinalizar isoladamente.
+
+    Calculado UMA vez por ciclo a partir do df_bruto já carregado em memória
+    — sem custo de API adicional. Retorna uma Series indexada por hora
+    arredondada, mesclada depois em cada item via preparar_indicadores().
+    """
+    df = df_bruto_local.copy()
+    df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['Timestamp_dt']).sort_values(['Item', 'Timestamp_dt'])
+
+    df['Pct_Change'] = df.groupby('Item')['Price'].pct_change()
+    df['Hora_Arredondada'] = df['Timestamp_dt'].dt.floor('h')
+
+    indice = df.groupby('Hora_Arredondada')['Pct_Change'].mean()
+    return indice.rename('Indice_Mercado_Chg')
+
+
+def preparar_indicadores(df_original, nome_item, indice_mercado=None):
     """
     Prepara os indicadores técnicos e divide os dados em treino/teste
     respeitando a ordem temporal (sem data leakage).
@@ -651,7 +710,7 @@ def preparar_indicadores(df_original, nome_item):
     # Garante que as colunas do modelo existem mesmo se o histórico for curto
     for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro',
                 'Season_Num', 'Lag_1', 'Lag_2', 'Lag_3', 'Hora_Dia', 'Dia_Semana',
-                'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
+                'Indice_Mercado_Chg', 'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
         d[col] = np.nan
     d['is_holdout'] = False
 
@@ -695,6 +754,24 @@ def preparar_indicadores(df_original, nome_item):
     d['Hora_Dia']    = d['Timestamp'].dt.hour
     d['Dia_Semana']  = d['Timestamp'].dt.dayofweek
     d['Preco_Futuro']= d['Price'].shift(-SHIFT_ALVO)
+
+    # Indice_Mercado_Chg: momentum agregado de TODOS os itens naquela hora —
+    # captura choques de mercado inteiro (eventos, atualizações do jogo) que
+    # nenhum item sozinho sinaliza. Calculado uma vez fora do loop e mesclado
+    # aqui por hora arredondada; ausente (item sem indice_mercado passado)
+    # ou sem correspondência → 0.0 (neutro, sem viés).
+    if indice_mercado is not None:
+        d['Hora_Arredondada'] = d['Timestamp'].dt.floor('h')
+        d = d.merge(indice_mercado, left_on='Hora_Arredondada', right_index=True, how='left')
+        # merge duplica a coluna Indice_Mercado_Chg (uma da inicialização NaN,
+        # outra do merge) — consolida mantendo a versão mesclada
+        if 'Indice_Mercado_Chg_y' in d.columns:
+            d['Indice_Mercado_Chg'] = d['Indice_Mercado_Chg_y']
+            d = d.drop(columns=['Indice_Mercado_Chg_x', 'Indice_Mercado_Chg_y'])
+        d['Indice_Mercado_Chg'] = d['Indice_Mercado_Chg'].fillna(0.0)
+        d = d.drop(columns=['Hora_Arredondada'])
+    else:
+        d['Indice_Mercado_Chg'] = 0.0
 
     # Peso temporal exponencial (dados mais recentes pesam mais)
     max_date = d['Timestamp'].max()
@@ -1267,22 +1344,17 @@ if not df_val.empty:
     try:
         df_alocacao = calcular_alocacao_recursos(df_val, dias_swing=DIAS_SWING, min_sinais=3)
         if not df_alocacao.empty:
-            try:
-                ws_aloc = sh.worksheet("Alocacao_Recursos")
-            except Exception:
-                ws_aloc = sh.add_worksheet(title="Alocacao_Recursos", rows="200", cols="8")
-                set_frozen(ws_aloc, rows=1)
-                format_cell_range(ws_aloc, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
-
-            ws_aloc.clear()
-            ws_aloc.update(
-                values=[df_alocacao.columns.tolist()] + df_alocacao.values.tolist(),
-                range_name='A1',
-                value_input_option='USER_ENTERED'
+            ok_aloc = salvar_aba_atomica(
+                sh, "Alocacao_Recursos",
+                df_alocacao.columns.tolist(), df_alocacao.values.tolist(),
+                rows_est=200, cols_est=8
             )
-            top3 = ", ".join(df_alocacao.head(3)['Item'].tolist())
-            print(f"💰 Alocação de Recursos: {len(df_alocacao)} itens com dados suficientes "
-                  f"(min. 3 sinais concluídos) | Top 3: {top3}")
+            if ok_aloc:
+                top3 = ", ".join(df_alocacao.head(3)['Item'].tolist())
+                print(f"💰 Alocação de Recursos: {len(df_alocacao)} itens com dados suficientes "
+                      f"(min. 3 sinais concluídos) | Top 3: {top3}")
+            else:
+                print("⚠️ Alocação de Recursos não foi atualizada neste ciclo — dados anteriores preservados.")
         else:
             print("💰 Alocação de Recursos: aguardando sinais concluídos suficientes (mín. 3 por item).")
     except Exception as e:
@@ -1411,12 +1483,17 @@ except Exception:
 cache_indicadores = {}
 ranking = []
 audit_linhas = []   # acumula métricas para gravar na aba XGB_Audit ao final
+
+# Índice de mercado (item 6 dos parâmetros adaptativos): calculado UMA vez
+# para todos os itens, a partir do df_bruto já em memória — sem custo de API.
+indice_mercado = calcular_indice_mercado(df_bruto)
+
 X_cols = ['Price', 'Lag_1', 'Lag_2', 'Lag_3', 'RSI_Micro', 'Media_Macro',
-          'Desvio_Macro', 'Season_Num', 'Hora_Dia', 'Dia_Semana']
+          'Desvio_Macro', 'Season_Num', 'Hora_Dia', 'Dia_Semana', 'Indice_Mercado_Chg']
 
 for item in df_bruto['Item'].unique():
     try:
-        d_it = preparar_indicadores(df_bruto, item)
+        d_it = preparar_indicadores(df_bruto, item, indice_mercado=indice_mercado)
         cache_indicadores[item] = d_it
 
         # Separação temporal: treino = sem holdout, teste = holdout
@@ -1430,9 +1507,13 @@ for item in df_bruto['Item'].unique():
             continue
 
         # --- TREINO ---
+        # Hiperparâmetros ajustados pela volatilidade real do item (item 6 dos
+        # parâmetros adaptativos) — antes n_estimators/max_depth eram fixos
+        # para os 63 itens, independente de perfil de risco/liquidez.
+        n_est, max_d = calcular_hiperparametros_xgb(d_treino)
         model = xgb.XGBRegressor(
-            n_estimators=40,
-            max_depth=3,
+            n_estimators=n_est,
+            max_depth=max_d,
             verbosity=0           # sem output no console
         ).fit(
             d_treino[X_cols],
