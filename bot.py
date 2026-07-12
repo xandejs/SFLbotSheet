@@ -1565,7 +1565,12 @@ lista_final = []
 for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitrário
     d_it = cache_indicadores.get(item)
     row = d_it.iloc[-1]
-    roi_pred = df_ranking[df_ranking['Item'] == item]['ROI'].values[0]
+    # ROI_Ajustado (não ROI cru): incorpora a penalidade/bônus da calibração
+    # Bayesiana (mapa_ajuste_roi) na decisão de fato — antes essa penalidade
+    # só reordenava df_ranking (via sort_values acima) e nunca chegava ao
+    # Estado_RL, ao stop loss adaptativo, ao veto RL ou ao ROI exibido, que
+    # liam a coluna 'ROI' crua. Ver ARQUITETURA.md para o histórico da mudança.
+    roi_pred = df_ranking[df_ranking['Item'] == item]['ROI_Ajustado'].values[0]
     saldo_item = inv_dict.get(item, 0)
 
     # Itens com saldo zero não devem gerar sinais de VENDA nem entrar no FIFO.
