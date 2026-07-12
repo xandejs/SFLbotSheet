@@ -207,11 +207,15 @@ def calcular_prior_empirico(df_conc, forca_prior=4.0):
     return prior_a, prior_b
 
 
-def calibrar_por_taxa_confianca(sh, df_val_mem, mapa_mult, mapa_roi, mapa_veto):
+def calibrar_por_taxa_confianca(df_val_mem, mapa_mult, mapa_roi, mapa_veto):
     """
     Recalibra os mapas usando taxa Bayesiana em vez do threshold fixo de 45%.
     Chamada dentro de construir_calibracao_hibrida, após o loop padrão.
     Modifica os mapas in-place para os itens que têm dados suficientes.
+
+    Correção 4.23.3: removido o parâmetro 'sh' (Google Sheet), que nunca era
+    usado dentro da função — ficava só como ruído na assinatura, sem afetar
+    comportamento, mas era código morto.
     """
     if df_val_mem is None or df_val_mem.empty:
         return
@@ -910,7 +914,7 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_me
             # Calibração Bayesiana — substitui o threshold fixo 45%/70%.
             # Usa valor esperado (EV) por sinal em vez de taxa bruta,
             # e exige amostra mínima antes de vetar (evita falso negativo com poucos dados).
-            calibrar_por_taxa_confianca(sh, df_val_mem, mapa_mult, mapa_roi, mapa_veto)
+            calibrar_por_taxa_confianca(df_val_mem, mapa_mult, mapa_roi, mapa_veto)
             print(f"📈 Calibração Bayesiana: {df_concluidos['Item'].nunique()} itens | "
                   f"{len(df_concluidos)} sinais concluídos processados.")
 
@@ -1441,7 +1445,19 @@ if not df_val.empty:
     try:
         for _, row_u in df_val.iterrows():
             chave_u = f"{str(row_u['Item']).strip()}_{str(row_u['Tipo']).strip().upper()}"
-            ts_u    = pd.to_datetime(row_u['Data_Sinal'], dayfirst=True, errors='coerce')
+            # Correção 4.23.3: usa a mesma função de parsing robusto já aplicada
+            # na validação de sinais (parse_data_sinal_robusta), em vez de um
+            # pd.to_datetime cru que não tentava formatos alternativos — as duas
+            # fontes de verdade sobre Data_Sinal agora concordam entre si.
+            # Se mesmo assim vier NaT (data ilegível), pula a linha em vez de
+            # deixar um timestamp inválido entrar no mapa: uma comparação
+            # "NaT > timestamp_valido" é sempre False, então guardar NaT aqui
+            # tanto pode mascarar silenciosamente uma entrada mais recente
+            # válida quanto, se for a única linha para a chave, propagar NaT
+            # para o cálculo de horas_desde mais adiante.
+            ts_u = parse_data_sinal_robusta(row_u['Data_Sinal'])
+            if pd.isnull(ts_u):
+                continue
             preco_u = limpar_numero(row_u['Preco_Sinal'])
             if chave_u not in mapa_ultimo_sinal or ts_u > mapa_ultimo_sinal[chave_u]['timestamp']:
                 mapa_ultimo_sinal[chave_u] = {'preco': preco_u, 'timestamp': ts_u}
@@ -1694,7 +1710,15 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         agora_brt   = obter_agora_brt()
         dt_hoje_str = agora_brt.strftime("%d%m%Y")
         dt_hhmm     = agora_brt.strftime("%H%M")
-        tipo_sinal  = "COMPRA" if ("COMPRAR" in acao or em_crash) else "VENDA"
+        # Correção 4.23.3: antes, "or em_crash" sozinho podia forçar tipo_sinal="COMPRA"
+        # mesmo quando a ação real era uma VENDA/STOP LOSS que coincidisse com um item
+        # também em crash de 24h (cenário nada raro: stop loss e crash tendem a
+        # acontecer juntos). Isso contaminava Referencia_Fin, Chave_Unica, a validação
+        # do sinal e o aprendizado do Cerebro_RL para esse sinal. Agora tipo_sinal
+        # depende só do conteúdo real de "acao" — em_crash já foi corretamente
+        # aplicado antes (linha do alerta "⚠️ COMPRAR (QUEDA...)") e continua refletido
+        # em "acao" quando de fato for uma compra.
+        tipo_sinal  = "COMPRA" if "COMPRAR" in acao else "VENDA"
         sufixo      = "_STOP" if "Stop Loss" in acao else ""
 
         # --- DEDUPLICAÇÃO HÍBRIDA: mínimo 4h + variação ≥ 3% ---
