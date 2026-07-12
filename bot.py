@@ -635,6 +635,30 @@ def limpar_numero(texto):
     try: return float(s)
     except: return 0.0
 
+def parse_data_sinal_robusta(texto):
+    """
+    Faz o parse de Data_Sinal tentando múltiplos formatos antes de desistir.
+
+    Motivo: o formato gravado pelo próprio bot é sempre "%d/%m/%Y %H:%M", mas
+    edição manual da planilha ou um schema antigo podem gravar em outro
+    formato. Antes, um parse que falhasse virava NaT e era tratado como
+    dias_p=0 — o sinal nunca atingia DIAS_SWING nem DIAS_MAX_MONITORAMENTO e
+    ficava preso em 'Aguardando' PARA SEMPRE (silenciosamente, sem contar em
+    nenhum lugar). Esta função só retorna pd.NaT se NENHUM formato conhecido
+    funcionar, e quem chama trata esse caso como erro explícito, não como
+    dias_p=0.
+    """
+    if not texto or str(texto).strip() == "":
+        return pd.NaT
+    texto = str(texto).strip()
+    for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y"):
+        dt = pd.to_datetime(texto, format=fmt, errors='coerce')
+        if pd.notnull(dt):
+            return dt
+    # Último recurso: inferência automática do pandas (dayfirst=True, já que
+    # o formato nativo do bot é dd/mm/aaaa)
+    return pd.to_datetime(texto, dayfirst=True, errors='coerce')
+
 def calcular_fifo_hibrido(df_trade_raw, inventario_dict):
     try:
         df_log = df_trade_raw.copy()
@@ -867,6 +891,10 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_me
     mapa_veto = {}
     mapa_roi  = {}
     _confianca = {}   # metadado interno: 0.0 (só proxy) a 1.0 (só histórico real)
+    # df_audit_retorno: cache de XGB_Audit devolvido ao chamador para reaproveitar
+    # no stop loss adaptativo mais adiante — evita uma 2ª leitura da mesma aba
+    # no mesmo ciclo (economiza 1 chamada de API por execução).
+    df_audit_retorno = pd.DataFrame(columns=HEADERS_AUDIT)
 
     # ------------------------------------------------------------------
     # FONTE 1: Taxa de acerto real — usa df_val já em memória
@@ -911,10 +939,16 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_me
             df_audit = pd.DataFrame(audit_data[1:], columns=audit_data[0])
             df_audit['MAE']              = df_audit['MAE'].apply(limpar_numero)
             df_audit['Acerto_Direcao_%'] = df_audit['Acerto_Direcao_%'].apply(limpar_numero)
-            df_audit = df_audit[df_audit['MAE'] > 0].copy()
+
+            # Versão completa (sem filtro de MAE>0) devolvida ao chamador —
+            # é a mesma estrutura que calcular_stop_adaptativo espera, que já
+            # filtra MAE>0 internamente por conta própria.
+            df_audit_retorno = df_audit.copy()
+
+            df_audit_proxy = df_audit[df_audit['MAE'] > 0].copy()
 
             n_proxy = 0
-            for item_a, grupo in df_audit.groupby('Item'):
+            for item_a, grupo in df_audit_proxy.groupby('Item'):
                 ultimos      = grupo.tail(JANELA_AUDIT)
                 mae_medio    = ultimos['MAE'].mean()
                 acerto_medio = ultimos['Acerto_Direcao_%'].mean()
@@ -964,7 +998,7 @@ def construir_calibracao_hibrida(sh, df_bruto_local, df_val_mem=None, q_table_me
         print(f"🧠 Cerebro_RL operacional: {n_estados} estados memorizados.")
 
     print(f"✅ Calibração final: {len(mapa_mult)} itens com parâmetros ajustados.")
-    return mapa_mult, mapa_veto, mapa_roi
+    return mapa_mult, mapa_veto, mapa_roi, df_audit_retorno
 
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL
@@ -1107,14 +1141,24 @@ if not df_val.empty:
         if row_val['Status'] == 'Aguardando' or row_val['Status'] == '':
             item_v = row_val['Item']
             tipo_v = row_val['Tipo']
-            data_sinal_v = pd.to_datetime(row_val['Data_Sinal'], format="%d/%m/%Y %H:%M", errors='coerce')
+            data_sinal_v = parse_data_sinal_robusta(row_val['Data_Sinal'])
             preco_sinal_v = limpar_numero(row_val['Preco_Sinal'])
             ref_fin_v = limpar_numero(row_val['Referencia_Fin'])
-            
-            if pd.notnull(data_sinal_v):
-                dias_p = (obter_agora_brt() - data_sinal_v).days
-            else:
-                dias_p = 0  
+
+            if pd.isnull(data_sinal_v):
+                # Data ilegível mesmo após tentar formatos alternativos. Antes
+                # isso virava dias_p=0 e o sinal ficava em 'Aguardando' para
+                # sempre (nunca atinge DIAS_SWING). Agora força um status de
+                # erro explícito — sai do loop de Aguardando imediatamente,
+                # sem entrar em Cerebro_RL nem em Alocação de Recursos (não
+                # contém 🏆/❌/💰, então os filtros que procuram por essas
+                # marcações ignoram esta linha), e fica visível na planilha
+                # para verificação manual.
+                df_val.at[idx, 'Dias_Passados'] = 0
+                df_val.at[idx, 'Status'] = "⚠️ ERRO_DATA (Verificar Manualmente)"
+                continue
+
+            dias_p = (obter_agora_brt() - data_sinal_v).days
             
             d_hist = df_bruto[df_bruto['Item'] == item_v].copy()
             d_hist['Timestamp'] = pd.to_datetime(d_hist['Timestamp'], dayfirst=True, errors='coerce')
@@ -1409,24 +1453,14 @@ if not df_val.empty:
 # Calibração híbrida: combina taxa de acerto real (Validacao_Sinais)
 # + proxy de MAE do XGBoost (XGB_Audit do ciclo anterior).
 # Chamada aqui, após a q_table estar atualizada e df_val pronto em memória.
-mapa_mult_desvio, mapa_veto, mapa_ajuste_roi = construir_calibracao_hibrida(sh, df_bruto, df_val_mem=df_val, q_table_mem=q_table)
+# df_audit_cache vem de dentro da própria função — antes a aba XGB_Audit era
+# lida 2x por ciclo (aqui e dentro de construir_calibracao_hibrida); agora é
+# lida 1x só e reaproveitada, economizando 1 chamada de API por execução.
+mapa_mult_desvio, mapa_veto, mapa_ajuste_roi, df_audit_cache = construir_calibracao_hibrida(sh, df_bruto, df_val_mem=df_val, q_table_mem=q_table)
 
 # Nº de observações concluídas por estado RL — usado pelo veto adaptativo (item 1)
 # para endurecer/afrouxar o threshold conforme a quantidade de evidência disponível.
 n_obs_rl_map = contar_obs_por_estado(df_val)
-
-# Cache de auditoria do XGBoost (XGB_Audit) — usado pelo stop loss adaptativo
-# (item 3) para normalizar o gatilho pelo erro médio (MAE) de cada item.
-try:
-    ws_audit_cache   = sh.worksheet("XGB_Audit")
-    audit_cache_data = ws_audit_cache.get_all_values()
-    if len(audit_cache_data) > 1:
-        df_audit_cache = pd.DataFrame(audit_cache_data[1:], columns=audit_cache_data[0])
-        df_audit_cache['MAE'] = df_audit_cache['MAE'].apply(limpar_numero)
-    else:
-        df_audit_cache = pd.DataFrame(columns=HEADERS_AUDIT)
-except Exception:
-    df_audit_cache = pd.DataFrame(columns=HEADERS_AUDIT)
 
 # ==============================================================================
 # 2. IA E TREINAMENTO
@@ -1684,7 +1718,12 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
         # HHmm na chave distingue múltiplos sinais válidos no mesmo dia
         chave_unica = f"{item}_{tipo_sinal}_{dt_hoje_str}_{dt_hhmm}{sufixo}"
 
-        if pode_gerar and chave_unica not in df_val.get('Chave_Unica', pd.Series([], dtype=str)).values:
+        # A deduplicação real é feita por 'pode_gerar' (mapa_ultimo_sinal, acima):
+        # tempo mínimo + variação de preço. Uma checagem "chave_unica not in
+        # df_val['Chave_Unica']" existia aqui antes, mas como a chave inclui
+        # HH:mm, ela só colidiria se o bot rodasse duas vezes no mesmo minuto —
+        # praticamente nunca acontece e não somava proteção real. Removida.
+        if pode_gerar:
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
                 # Fallback de segurança: se mapa_ultimo_sinal falhou, usa deduplicação
                 # por data simples (1 sinal/item/dia) para evitar spam por ciclo.
