@@ -1129,7 +1129,7 @@ if not df_val.empty:
 
             # VENDA comum: conta horas em que o preço ficou <= Referencia_Fin (custo médio).
             # Se o preço CAIU abaixo do custo médio após a venda → a venda foi sábia.
-            # >= 3h abaixo → 🏆 ACERTOU (TOPO) — queda confirmada, dava pra executar
+            # >= 3h abaixo → 🏆 ACERTOU (FUNDO) — queda confirmada, dava pra executar
             # >= 1h abaixo → 💰 LUCRO PARCIAL (SPIKE) — caiu brevemente
             #   0h abaixo  → ❌ FALHOU — preço nunca chegou abaixo da ref, venda foi prematura
             horas_venda = int((df_pos_sinal['Price'] <= ref_fin_v).sum()) if not df_pos_sinal.empty else 0
@@ -1201,7 +1201,7 @@ if not df_val.empty:
                 else:
                     if dias_p >= DIAS_SWING:
                         if horas_venda >= 3:
-                            status_v = "🏆 ACERTOU (TOPO)"
+                            status_v = "🏆 ACERTOU (FUNDO)"
                         elif horas_venda >= 1:
                             if dias_p >= DIAS_MAX_MONITORAMENTO:
                                 status_v = "💰 LUCRO PARCIAL (SPIKE)"
@@ -1327,7 +1327,7 @@ if not df_val.empty:
                 roi_real_pct = calcular_roi_real(acao_rl, preco_sinal_r, preco_final_r)
                 recompensa = max(-2.0, min(2.0, roi_real_pct / (LUCRO_REAL_DESEJADO * 100)))
             # Fallback categórico para sinais antigos sem Preco_Final (schema pré-migração)
-            elif status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (TOPO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
+            elif status_rl in ["🏆 ACERTOU", "🏆 ACERTOU (FUNDO)", "🏆 ACERTOU (STOP PROTETIVO)"]:
                 recompensa = 1.0
             elif status_rl in ["💰 LUCRO (SUBIU)", "💰 LUCRO PARCIAL", "💰 LUCRO PARCIAL (SPIKE)"]:
                 recompensa = 0.5
