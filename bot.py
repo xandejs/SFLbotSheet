@@ -308,42 +308,6 @@ def calcular_stop_adaptativo(item, preco_atual, roi_pred,
 # Solução: margem = fração fixa da largura da banda de Bollinger.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def calcular_hiperparametros_xgb(d_treino, cv_baixo=0.03, cv_alto=0.10):
-    """
-    Ajusta n_estimators/max_depth por tier de volatilidade do item, em vez de
-    usar os mesmos hiperparâmetros fixos para os 63 itens.
-
-    Volatilidade = coeficiente de variação médio no período de treino
-    (Desvio_Macro / Media_Macro) — mesma métrica já usada em detectar_regime
-    e na discretização do Estado_RL, mantendo consistência entre os módulos.
-
-    Baixa volatilidade (ex: Potato, Rhubarb — preço quase flat):
-        menos árvores e menor profundidade. Com pouco sinal real de
-        variação, uma árvore mais complexa aprende ruído, não padrão.
-
-    Alta volatilidade (ex: Obsidian, Moonfur, Crimstone):
-        mais árvores e profundidade extra. Há mais estrutura real no
-        movimento de preço para o modelo capturar, e overfit em ruído
-        é proporcionalmente menos provável quando o sinal é mais forte.
-
-    Retorna (n_estimators, max_depth). Em caso de dados insuficientes
-    para calcular o CV, retorna o default atual (40, 3) como fallback seguro.
-    """
-    if 'Desvio_Macro' not in d_treino or 'Media_Macro' not in d_treino:
-        return 40, 3
-
-    cv = (d_treino['Desvio_Macro'] / d_treino['Media_Macro'].replace(0, np.nan)).mean()
-    if pd.isna(cv):
-        return 40, 3
-
-    if cv < cv_baixo:
-        return 25, 2
-    elif cv < cv_alto:
-        return 40, 3
-    else:
-        return 60, 4
-
-
 def calcular_margem_atencao(alvo_in, alvo_out, fracao=0.15,
                              minimo_abs=0.0001, maximo_pct=0.10):
     """
@@ -495,7 +459,13 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
 
         dias_validos = grupo['Dias_Ate_Alvo_N'].dropna()
         dias_medio   = dias_validos.mean() if not dias_validos.empty else float(dias_swing)
-        dias_medio   = max(dias_medio, 0.5)
+        # Piso de 1 dia: abaixo disso, o expoente de anualização (365/dias)
+        # explode matematicamente (ex: 0.5 dia → expoente 730). Compor "se eu
+        # repetisse isso 700+ vezes por ano" não é uma métrica útil — é ruído
+        # de amostra pequena (sustentação em poucas horas) virando um número
+        # sem sentido prático, que ainda por cima dominaria 100% do peso de
+        # alocação e zeraria todos os outros itens legítimos no ranking.
+        dias_medio   = max(dias_medio, 1.0)
 
         roi_medio_pct = grupo['ROI_Realizado'].mean()
         roi_frac      = roi_medio_pct / 100
@@ -504,6 +474,12 @@ def calcular_alocacao_recursos(df_val_mem, dias_swing=12, min_sinais=3):
             retorno_anualizado = ((1 + roi_frac) ** (365 / dias_medio) - 1) * 100
         except (OverflowError, ZeroDivisionError):
             retorno_anualizado = 0.0
+
+        # Teto de sanidade: mesmo com o piso de 1 dia, um ROI alto ainda pode
+        # gerar um número grande demais para ser útil na tabela. Capado em
+        # 2000% (21x ao ano) — já um teto extremamente generoso, que preserva
+        # a ordenação relativa sem deixar um único item dominar o ranking.
+        retorno_anualizado = min(retorno_anualizado, 2000.0)
 
         peso_confianca = taxa_ef if confiante else taxa_ef * 0.5
         score = retorno_anualizado * peso_confianca if ev > 0 else 0.0
@@ -672,30 +648,7 @@ def calcular_fifo_hibrido(df_trade_raw, inventario_dict):
     except Exception as e:
         print(f"Erro FIFO: {e}"); return {}
 
-def calcular_indice_mercado(df_bruto_local):
-    """
-    Índice agregado de momentum do mercado inteiro (item 6 dos parâmetros
-    adaptativos) — variação % média de preço, por hora, através de TODOS
-    os itens do RecLog. Captura choques que afetam o jogo inteiro (eventos
-    sazonais, atualizações de conteúdo, mudanças de mecânica) que nenhum
-    item sozinho consegue sinalizar isoladamente.
-
-    Calculado UMA vez por ciclo a partir do df_bruto já carregado em memória
-    — sem custo de API adicional. Retorna uma Series indexada por hora
-    arredondada, mesclada depois em cada item via preparar_indicadores().
-    """
-    df = df_bruto_local.copy()
-    df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['Timestamp_dt']).sort_values(['Item', 'Timestamp_dt'])
-
-    df['Pct_Change'] = df.groupby('Item')['Price'].pct_change()
-    df['Hora_Arredondada'] = df['Timestamp_dt'].dt.floor('h')
-
-    indice = df.groupby('Hora_Arredondada')['Pct_Change'].mean()
-    return indice.rename('Indice_Mercado_Chg')
-
-
-def preparar_indicadores(df_original, nome_item, indice_mercado=None):
+def preparar_indicadores(df_original, nome_item):
     """
     Prepara os indicadores técnicos e divide os dados em treino/teste
     respeitando a ordem temporal (sem data leakage).
@@ -710,7 +663,7 @@ def preparar_indicadores(df_original, nome_item, indice_mercado=None):
     # Garante que as colunas do modelo existem mesmo se o histórico for curto
     for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro',
                 'Season_Num', 'Lag_1', 'Lag_2', 'Lag_3', 'Hora_Dia', 'Dia_Semana',
-                'Indice_Mercado_Chg', 'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
+                'Preco_Futuro', 'Peso_Temporal', 'is_holdout']:
         d[col] = np.nan
     d['is_holdout'] = False
 
@@ -754,24 +707,6 @@ def preparar_indicadores(df_original, nome_item, indice_mercado=None):
     d['Hora_Dia']    = d['Timestamp'].dt.hour
     d['Dia_Semana']  = d['Timestamp'].dt.dayofweek
     d['Preco_Futuro']= d['Price'].shift(-SHIFT_ALVO)
-
-    # Indice_Mercado_Chg: momentum agregado de TODOS os itens naquela hora —
-    # captura choques de mercado inteiro (eventos, atualizações do jogo) que
-    # nenhum item sozinho sinaliza. Calculado uma vez fora do loop e mesclado
-    # aqui por hora arredondada; ausente (item sem indice_mercado passado)
-    # ou sem correspondência → 0.0 (neutro, sem viés).
-    if indice_mercado is not None:
-        d['Hora_Arredondada'] = d['Timestamp'].dt.floor('h')
-        d = d.merge(indice_mercado, left_on='Hora_Arredondada', right_index=True, how='left')
-        # merge duplica a coluna Indice_Mercado_Chg (uma da inicialização NaN,
-        # outra do merge) — consolida mantendo a versão mesclada
-        if 'Indice_Mercado_Chg_y' in d.columns:
-            d['Indice_Mercado_Chg'] = d['Indice_Mercado_Chg_y']
-            d = d.drop(columns=['Indice_Mercado_Chg_x', 'Indice_Mercado_Chg_y'])
-        d['Indice_Mercado_Chg'] = d['Indice_Mercado_Chg'].fillna(0.0)
-        d = d.drop(columns=['Hora_Arredondada'])
-    else:
-        d['Indice_Mercado_Chg'] = 0.0
 
     # Peso temporal exponencial (dados mais recentes pesam mais)
     max_date = d['Timestamp'].max()
@@ -1344,17 +1279,22 @@ if not df_val.empty:
     try:
         df_alocacao = calcular_alocacao_recursos(df_val, dias_swing=DIAS_SWING, min_sinais=3)
         if not df_alocacao.empty:
-            ok_aloc = salvar_aba_atomica(
-                sh, "Alocacao_Recursos",
-                df_alocacao.columns.tolist(), df_alocacao.values.tolist(),
-                rows_est=200, cols_est=8
+            try:
+                ws_aloc = sh.worksheet("Alocacao_Recursos")
+            except Exception:
+                ws_aloc = sh.add_worksheet(title="Alocacao_Recursos", rows="200", cols="8")
+                set_frozen(ws_aloc, rows=1)
+                format_cell_range(ws_aloc, 'A1:H1', CellFormat(textFormat=TextFormat(bold=True)))
+
+            ws_aloc.clear()
+            ws_aloc.update(
+                values=[df_alocacao.columns.tolist()] + df_alocacao.values.tolist(),
+                range_name='A1',
+                value_input_option='USER_ENTERED'
             )
-            if ok_aloc:
-                top3 = ", ".join(df_alocacao.head(3)['Item'].tolist())
-                print(f"💰 Alocação de Recursos: {len(df_alocacao)} itens com dados suficientes "
-                      f"(min. 3 sinais concluídos) | Top 3: {top3}")
-            else:
-                print("⚠️ Alocação de Recursos não foi atualizada neste ciclo — dados anteriores preservados.")
+            top3 = ", ".join(df_alocacao.head(3)['Item'].tolist())
+            print(f"💰 Alocação de Recursos: {len(df_alocacao)} itens com dados suficientes "
+                  f"(min. 3 sinais concluídos) | Top 3: {top3}")
         else:
             print("💰 Alocação de Recursos: aguardando sinais concluídos suficientes (mín. 3 por item).")
     except Exception as e:
@@ -1483,17 +1423,12 @@ except Exception:
 cache_indicadores = {}
 ranking = []
 audit_linhas = []   # acumula métricas para gravar na aba XGB_Audit ao final
-
-# Índice de mercado (item 6 dos parâmetros adaptativos): calculado UMA vez
-# para todos os itens, a partir do df_bruto já em memória — sem custo de API.
-indice_mercado = calcular_indice_mercado(df_bruto)
-
 X_cols = ['Price', 'Lag_1', 'Lag_2', 'Lag_3', 'RSI_Micro', 'Media_Macro',
-          'Desvio_Macro', 'Season_Num', 'Hora_Dia', 'Dia_Semana', 'Indice_Mercado_Chg']
+          'Desvio_Macro', 'Season_Num', 'Hora_Dia', 'Dia_Semana']
 
 for item in df_bruto['Item'].unique():
     try:
-        d_it = preparar_indicadores(df_bruto, item, indice_mercado=indice_mercado)
+        d_it = preparar_indicadores(df_bruto, item)
         cache_indicadores[item] = d_it
 
         # Separação temporal: treino = sem holdout, teste = holdout
@@ -1507,13 +1442,9 @@ for item in df_bruto['Item'].unique():
             continue
 
         # --- TREINO ---
-        # Hiperparâmetros ajustados pela volatilidade real do item (item 6 dos
-        # parâmetros adaptativos) — antes n_estimators/max_depth eram fixos
-        # para os 63 itens, independente de perfil de risco/liquidez.
-        n_est, max_d = calcular_hiperparametros_xgb(d_treino)
         model = xgb.XGBRegressor(
-            n_estimators=n_est,
-            max_depth=max_d,
+            n_estimators=40,
+            max_depth=3,
             verbosity=0           # sem output no console
         ).fit(
             d_treino[X_cols],
@@ -1758,11 +1689,19 @@ for item in df_ranking['Item']:  # todos os itens qualificados, sem corte arbitr
                 # COMPRA     → alvo_out (preço de saída desejado, acima do sinal)
                 # VENDA STOP → preco_atual (o próprio nível do stop — validação checa se
                 #              o preço ficou abaixo dele após a saída)
-                # VENDA comum→ custo_medio (confirma se o preço caiu abaixo do custo)
+                # VENDA comum, origem=Revenda  → custo_medio (confirma se caiu abaixo do
+                #              que você realmente pagou — referência de custo é significativa)
+                # VENDA comum, origem=Colheita → Media_Macro (não existe custo real a
+                #              proteger num item majoritariamente colhido/grátis; o FIFO
+                #              calcula a média só da fração comprada, que pode estar
+                #              desconectada do saldo total. Media_Macro serve de
+                #              referência neutra: "caiu abaixo do preço normal recente?")
                 if tipo_sinal == "COMPRA":
                     ref_financeira = alvo_out
                 elif sufixo == "_STOP":
                     ref_financeira = preco_atual   # referência = nível do stop
+                elif origem == 1:
+                    ref_financeira = row['Media_Macro']
                 else:
                     ref_financeira = custo_medio
 
@@ -1826,31 +1765,48 @@ except Exception as e:
 # 4b. GRAVAÇÃO DA AUDITORIA DO XGBOOST (XGB_Audit)
 # ==============================================================================
 try:
-    JANELA_AUDIT_H  = 72
-    n_itens_reais   = df_bruto['Item'].nunique()
-    RETENCAO_AUDIT  = n_itens_reais * JANELA_AUDIT_H * 2
+    try:
+        ws_audit = sh.worksheet("XGB_Audit")
+    except Exception:
+        n_itens_init = df_bruto['Item'].nunique()
+        rows_init    = n_itens_init * 72 * 2 + 500   # teto inicial + folga
+        ws_audit = sh.add_worksheet(title="XGB_Audit", rows=str(rows_init), cols="8")
+        ws_audit.update(
+            values=[HEADERS_AUDIT],
+            range_name='A1',
+            value_input_option='USER_ENTERED'
+        )
+        set_frozen(ws_audit, rows=1)
+        format_cell_range(
+            ws_audit, 'A1:H1',
+            CellFormat(textFormat=TextFormat(bold=True))
+        )
+        print(f"📊 Aba XGB_Audit criada com {rows_init} linhas ({n_itens_init} itens detectados).")
+
+    # Rotação automática com teto dinâmico.
+    # Recalcula a cada ciclo com base nos itens únicos reais do RecLog —
+    # se novos itens forem adicionados ao jogo, o limite se ajusta sozinho.
+    JANELA_AUDIT_H  = 72                              # horas de histórico útil
+    n_itens_reais   = df_bruto['Item'].nunique()      # cresce automaticamente
+    RETENCAO_AUDIT  = n_itens_reais * JANELA_AUDIT_H * 2  # 2× margem de segurança
 
     if audit_linhas:
-        try:
-            ws_audit_leitura  = sh.worksheet("XGB_Audit")
-            dados_atuais      = ws_audit_leitura.get_all_values()
-            linhas_existentes = dados_atuais[1:] if len(dados_atuais) > 1 else []
-        except Exception:
-            linhas_existentes = []   # aba ainda não existe — primeira execução
+        dados_atuais = ws_audit.get_all_values()
+        header = dados_atuais[0] if dados_atuais else HEADERS_AUDIT
+        linhas_existentes = dados_atuais[1:] if len(dados_atuais) > 1 else []
 
         todas = linhas_existentes + audit_linhas
         if len(todas) > RETENCAO_AUDIT:
             todas = todas[-RETENCAO_AUDIT:]
 
-        ok_audit = salvar_aba_atomica(
-            sh, "XGB_Audit", HEADERS_AUDIT, todas,
-            rows_est=RETENCAO_AUDIT + 500, cols_est=8
+        ws_audit.clear()
+        ws_audit.update(
+            values=([header] + todas),
+            range_name='A1',
+            value_input_option='USER_ENTERED'
         )
-        if ok_audit:
-            print(f"📊 XGB_Audit: {len(audit_linhas)} novos | {len(todas)} retidos | "
-                  f"teto={RETENCAO_AUDIT} ({n_itens_reais} itens × {JANELA_AUDIT_H*2}h).")
-        else:
-            print("⚠️ XGB_Audit não foi atualizada neste ciclo — dados anteriores preservados.")
+        print(f"📊 XGB_Audit: {len(audit_linhas)} novos | {len(todas)} retidos | "
+              f"teto={RETENCAO_AUDIT} ({n_itens_reais} itens × {JANELA_AUDIT_H*2}h).")
     else:
         print("📊 XGB_Audit: nenhum item com dados suficientes para auditoria.")
 
