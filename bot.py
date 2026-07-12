@@ -29,8 +29,6 @@ SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA
 DIAS_MAX_MONITORAMENTO = 30
 
 # Configurações de Estratégia
-MARGEM_ATENCAO = 0.035    # [DEPRECATED] 3.5% fixo — substituído por calcular_margem_atencao()
-                           # (item 4 dos parâmetros adaptativos). Mantido apenas como referência.
 TOLERANCIA_SUJEIRA = 0.15 # até 15% harvest no saldo → ainda conta como Revenda
 
 # Piso de posição mínima em SFL para tratar um item como Revenda de fato.
@@ -108,7 +106,12 @@ def calcular_veto_rl(estado_rl, q_table, n_obs_por_estado=None,
     if n_obs < 5:
         threshold = -0.5     # poucos dados → exige evidência forte
     elif n_obs < 20:
-        threshold = -0.3 - 0.01 * (n_obs - 5)   # endurece gradualmente
+        # Interpolação linear contínua entre o limiar de n_obs=5 (-0.50, igual
+        # ao ramo anterior) e o limiar de n_obs=20 (-0.45, igual ao próximo
+        # ramo). Antes havia um salto descontínuo de -0.50 para -0.30 bem em
+        # n_obs=5, fazendo o veto ficar subitamente muito mais fácil de
+        # disparar assim que a 5ª observação chegava.
+        threshold = -0.5 + (0.05 / 15) * (n_obs - 5)
     else:
         threshold = -0.45    # teto: nunca mais rígido que -0.45
 
@@ -276,8 +279,15 @@ def calcular_stop_adaptativo(item, preco_atual, roi_pred,
     Retorna True se o stop loss deve ser ativado.
 
     Lógica:
-      threshold_stop = max(stop_minimo, -n_sigma × MAE_relativo)
-      capped em stop_maximo para evitar que items sem dados nunca parem
+      threshold_bruto = -n_sigma × MAE_relativo
+      threshold_stop  = clamp(threshold_bruto, entre stop_maximo e stop_minimo)
+
+      O clamp nos dois lados é necessário:
+        - min(stop_minimo, ...) evita que itens de baixíssima volatilidade
+          fiquem com um stop "sensível demais" (ex.: MAE_relativo minúsculo
+          geraria threshold perto de 0%, disparando o stop com qualquer ruído).
+        - max(stop_maximo, ...) evita que itens muito voláteis fiquem com um
+          stop tão frouxo que na prática nunca dispara.
 
     n_sigma=3: o ROI previsto precisa ser 3× o erro médio do modelo
                para ser considerado sinal real de queda (não ruído).
@@ -294,7 +304,8 @@ def calcular_stop_adaptativo(item, preco_atual, roi_pred,
                 mae_relativo = mae_medio / preco_atual
 
     if mae_relativo is not None and mae_relativo > 0:
-        threshold = max(stop_maximo, -n_sigma * mae_relativo)
+        threshold_bruto = -n_sigma * mae_relativo
+        threshold = max(stop_maximo, min(stop_minimo, threshold_bruto))
     else:
         threshold = -0.20   # fallback: -20% original sem dados de MAE
 
