@@ -14,7 +14,7 @@ from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFo
 # ==============================================================================
 NOME_PLANILHA = "SFL 2025_10"
 REGISTROS_POR_DIA = 24 
-TAXA_MARKETPLACE = 0.1
+TAXA_MARKETPLACE = 0.125
 LUCRO_REAL_DESEJADO = 0.07  # 7% de lucro real alvo
 DIAS_SWING = 12            
 SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA 
