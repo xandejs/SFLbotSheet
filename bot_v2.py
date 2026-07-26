@@ -83,12 +83,19 @@ HEADERS_AUDIT = [
 # produzir insumo próprio sem passar pelo marketplace, o que enfraquece
 # o vínculo de preço observável.
 MAPA_RECEITA = {
-    "Egg":     ["Wheat", "Corn", "Barley"],
-    "Feather": ["Wheat", "Corn", "Barley"],
-    "Milk":    ["Wheat", "Corn", "Barley"],
-    "Leather": ["Wheat", "Corn", "Barley"],
-    "Gold":    ["Wood", "Stone"],
-    # TODO: completar conforme confirmado pelo teste de correlação
+    # Produtos Animais (Ração/Grãos)
+    "Egg":         ["Wheat", "Corn", "Barley"],
+    "Feather":     ["Wheat", "Corn", "Barley"],
+    "Milk":        ["Wheat", "Corn", "Barley"],
+    "Leather":     ["Wheat", "Corn", "Barley"],
+    "Wool":        ["Wheat", "Corn", "Barley"],
+    "Merino Wool": ["Wheat", "Corn", "Barley"],
+    
+    # Recursos e Minérios
+    "Stone":       ["Wood"],
+    "Iron":        ["Wood", "Stone"],
+    "Gold":        ["Wood", "Iron"],
+    "Crimstone":   ["Wood", "Gold"],
 }
 
 # Peso igual para os 3 insumos de ração por ora — ajustar se o teste de
