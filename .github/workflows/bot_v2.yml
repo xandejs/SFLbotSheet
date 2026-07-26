@@ -1,0 +1,72 @@
+name: SFL Bot V2 (Sombra)
+
+# NÃO decide capital real — roda em paralelo ao workflow de produção (V1),
+# escrevendo numa planilha própria (ver PLANILHA_V2 em bot_v2.py e
+# ARQUITETURA_V2.md). Cron independente para não competir por concorrência
+# de job com a produção.
+
+on:
+  # Rode manualmente 1-2x ANTES de fixar o cron abaixo, para medir o custo
+  # real de runtime no relatório do Actions — não assuma que o modelo pooled
+  # é mais barato sem confirmar.
+  workflow_dispatch:
+
+  schedule:
+    # A cada 2h, no minuto 17 — evita o pico de carga do minuto :00 e não
+    # coincide com o minuto 11 do cron de produção (V1), reduzindo a chance
+    # de dois jobs de bot competindo por runner ao mesmo tempo.
+    - cron: '17 */2 * * *'
+
+jobs:
+  rodar-bot-v2:
+    runs-on: ubuntu-latest
+    # Ajuste após medir o custo real via workflow_dispatch manual — este é um
+    # valor de partida conservador, não uma medição.
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache de dependências pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          # Chave própria da V2 (sufixo -v2) para não colidir com o cache de
+          # dependências do workflow de produção, mesmo usando o mesmo
+          # requirements.txt.
+          key: ${{ runner.os }}-pip-v2-${{ hashFiles('requirements.txt') }}
+
+      - name: Cache do feature store incremental (indicadores + modelo pooled)
+        uses: actions/cache@v4
+        with:
+          path: cache_v2/
+          # actions/cache não permite sobrescrever uma chave existente — por
+          # isso a chave de gravação inclui o run_id (sempre nova), e a busca
+          # usa restore-keys por prefixo, que resolve para a entrada mais
+          # recente que combinar. Isso cria uma entrada de cache por
+          # execução; o GitHub expira entradas não usadas automaticamente
+          # (7 dias / limite de quota do repositório), então não deve
+          # acumular indefinidamente. Se notar o cache não sendo restaurado
+          # como esperado, confirme esse comportamento no relatório do
+          # Actions antes de assumir que é isso.
+          key: sfl-v2-feature-cache-${{ github.run_id }}
+          restore-keys: |
+            sfl-v2-feature-cache-
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Credenciais Google
+        # Mesmo secret/nome de step do workflow de produção (GOOGLE_CREDENTIALS).
+        # A mesma service account precisa ter acesso de edição também na
+        # planilha nova (compartilhe SFL 2025_10_V2 com o e-mail da service account).
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credenciais_robo.json
+
+      - name: Executar bot_v2.py
+        run: python bot_v2.py
