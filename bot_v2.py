@@ -819,6 +819,13 @@ def adicionar_features_correlacao(d_item, item, df_indice_racao):
         d_item['Margem_Insumo'] = np.nan
         return d_item
 
+    # Remove os placeholders NaN (já criados em _calcular_indicadores_do_zero)
+    # antes do merge — senão merge_asof colide com a coluna de mesmo nome
+    # vinda de df_indice_racao (gera Indice_Racao_x/_y em vez de preencher a
+    # coluna esperada, e o KeyError aparece mais adiante quando X_COLS_POOLED
+    # tenta acessar 'Indice_Racao').
+    d_item = d_item.drop(columns=['Indice_Racao', 'Margem_Insumo'], errors='ignore')
+
     d_item = pd.merge_asof(
         d_item.sort_values('Timestamp'),
         df_indice_racao.sort_values('Timestamp'),
