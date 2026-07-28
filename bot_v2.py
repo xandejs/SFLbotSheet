@@ -960,21 +960,41 @@ def deve_retreinar_pooled():
         return True
 
 
-def salvar_modelo_pooled(modelo, categorias):
+def salvar_modelo_pooled(modelo, categorias, features_treino):
     os.makedirs(CACHE_DIR, exist_ok=True)
     modelo.save_model(MODELO_POOLED_PATH)
     with open(MODELO_POOLED_META_PATH, "wb") as f:
-        pickle.dump({"ultimo_treino": obter_agora_brt(), "categorias_item": list(categorias)}, f)
+        pickle.dump({
+            "ultimo_treino": obter_agora_brt(),
+            "categorias_item": list(categorias),
+            # Schema de features usado no treino (nomes + ordem). Salvo para
+            # detectar, no carregamento, se o código mudou o conjunto de
+            # features desde que este modelo foi persistido (ex.: renomear
+            # ou adicionar/remover uma coluna) — sem isso, um modelo em cache
+            # de uma versão anterior do bot quebra o predict() com
+            # "feature_names mismatch" em vez de simplesmente retreinar.
+            "features_treino": list(features_treino),
+        }, f)
 
 
 def carregar_modelo_pooled():
     if not (os.path.exists(MODELO_POOLED_PATH) and os.path.exists(MODELO_POOLED_META_PATH)):
         return None, None
     try:
-        modelo = xgb.XGBRegressor(enable_categorical=True)
-        modelo.load_model(MODELO_POOLED_PATH)
         with open(MODELO_POOLED_META_PATH, "rb") as f:
             meta = pickle.load(f)
+
+        features_esperadas = X_COLS_POOLED + ['Item_Cat']
+        features_salvas = meta.get("features_treino")   # None em cache de versão anterior ao 4.24-v2.1
+        if features_salvas != features_esperadas:
+            print(f"⚠️ Schema de features do modelo pooled (V2) em cache não bate com o "
+                  f"esperado pelo código atual (salvo={features_salvas} | "
+                  f"esperado={features_esperadas}) — forçando retreino neste ciclo "
+                  f"em vez de usar o modelo desatualizado.")
+            return None, None
+
+        modelo = xgb.XGBRegressor(enable_categorical=True)
+        modelo.load_model(MODELO_POOLED_PATH)
         return modelo, meta.get("categorias_item")
     except Exception as e:
         print(f"⚠️ Falha ao carregar modelo pooled em cache ({e}) — será retreinado neste ciclo.")
@@ -1396,15 +1416,17 @@ if deve_retreinar_pooled():
     modelo_pooled = treinar_modelo_pooled(df_treino_pooled)
     categorias_item = sorted(df_treino_pooled['Item_Cat'].unique().tolist()) if not df_treino_pooled.empty else None
     if modelo_pooled is not None:
-        salvar_modelo_pooled(modelo_pooled, categorias_item)
+        salvar_modelo_pooled(modelo_pooled, categorias_item, X_COLS_POOLED + ['Item_Cat'])
 else:
     modelo_pooled, categorias_item = carregar_modelo_pooled()
     if modelo_pooled is None and not df_treino_pooled.empty:
-        # Fallback de segurança — nunca treinado ainda nesta run
+        # Fallback de segurança — nunca treinado ainda nesta run (inclui o
+        # caso de invalidação por schema de features desatualizado, ver
+        # carregar_modelo_pooled)
         modelo_pooled = treinar_modelo_pooled(df_treino_pooled)
         categorias_item = sorted(df_treino_pooled['Item_Cat'].unique().tolist())
         if modelo_pooled is not None:
-            salvar_modelo_pooled(modelo_pooled, categorias_item)
+            salvar_modelo_pooled(modelo_pooled, categorias_item, X_COLS_POOLED + ['Item_Cat'])
 
 # --- Métricas de auditoria (sempre frescas, mesmo sem retreino) ---
 audit_linhas = []
