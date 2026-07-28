@@ -11,9 +11,11 @@ O QUE MUDA em relação ao bot_4_24.py (V1) — ver ARQUITETURA_V2.md:
   1. Modelo pooled: 1 XGBoost treinado com os 63 itens juntos (Item como
      feature categórica), retreinado 1x/dia, em vez de 63 modelos
      individuais retreinados do zero a cada hora.
-  2. Features de correlação cruzada: índice de custo de ração
-     (Wheat/Corn/Barley) e margem insumo/saída para itens com receita
-     conhecida (MAPA_RECEITA).
+  2. Features de correlação cruzada: índice de custo de insumo (ex.:
+     Wheat/Corn/Barley para produtos animais, ou Wood/Stone/Iron/Gold para
+     a cadeia de minério) e margem insumo/saída, para qualquer item com
+     receita conhecida (MAPA_RECEITA) — generalizado por combinação de
+     insumos, não hardcoded para um único cluster.
   3. Cache incremental: indicadores técnicos (Media_Macro, Desvio_Macro,
      RSI_Micro etc.) persistidos entre execuções via cache do GitHub
      Actions — só as linhas novas desde o último ciclo são recalculadas,
@@ -90,21 +92,29 @@ MAPA_RECEITA = {
     "Leather":     ["Wheat", "Corn", "Barley"],
     "Wool":        ["Wheat", "Corn", "Barley"],
     "Merino Wool": ["Wheat", "Corn", "Barley"],
-    
-    # Recursos e Minérios
+
+    # Recursos e Minérios — cadeia (cada item usa o preço de mercado do
+    # insumo anterior diretamente, sem decompor recursivamente; o preço já
+    # embute o custo/escassez daquele elo, igual à lógica de ração abaixo).
     "Stone":       ["Wood"],
     "Iron":        ["Wood", "Stone"],
     "Gold":        ["Wood", "Iron"],
     "Crimstone":   ["Wood", "Gold"],
+    # TODO: completar conforme confirmado pelo teste de correlação
 }
 
-# Peso igual para os 3 insumos de ração por ora — ajustar se o teste de
-# correlação mostrar que um pesa mais que outro na prática.
-PESOS_RACAO = {"Wheat": 1 / 3, "Corn": 1 / 3, "Barley": 1 / 3}
+# NOTA: pesos NÃO são mais um dict fixo tipo {"Wheat": 1/3, ...} — cada item
+# usa peso igual entre OS SEUS PRÓPRIOS insumos (ver construir_indices_insumos
+# e adicionar_features_correlacao). Isso generaliza a lógica antes hardcoded
+# só para o cluster de ração (3 insumos fixos) para qualquer combinação,
+# incluindo a cadeia de minério (Stone/Iron/Gold/Crimstone), onde cada item
+# tem uma lista de insumos diferente. Ajustar pesos desiguais por insumo se
+# o teste de correlação (df.corr() com lag) mostrar que um pesa mais que
+# outro na prática — ver TODO acima.
 
 X_COLS_BASE = ['Price', 'Lag_1', 'Lag_2', 'Lag_3', 'RSI_Micro', 'Media_Macro',
                'Desvio_Macro', 'Season_Num', 'Hora_Dia', 'Dia_Semana']
-X_COLS_CORRELACAO = ['Indice_Racao', 'Margem_Insumo']
+X_COLS_CORRELACAO = ['Indice_Insumo', 'Margem_Insumo']
 X_COLS_POOLED = X_COLS_BASE + X_COLS_CORRELACAO
 
 # --- NOVO: cache incremental (feature store leve) ---
@@ -666,7 +676,7 @@ def _calcular_indicadores_do_zero(d_bruto_item, nome_item):
 
     for col in ['Media_Macro', 'Desvio_Macro', 'RSI_Micro', 'Season_Num',
                 'Lag_1', 'Lag_2', 'Lag_3', 'Hora_Dia', 'Dia_Semana',
-                'Preco_Futuro', 'Peso_Temporal', 'Indice_Racao', 'Margem_Insumo']:
+                'Preco_Futuro', 'Peso_Temporal', 'Indice_Insumo', 'Margem_Insumo']:
         d[col] = np.nan
     d['is_holdout'] = False
 
@@ -777,69 +787,95 @@ def preparar_indicadores_incremental(df_bruto_geral, nome_item, cache):
 
 
 # ==============================================================================
-# NOVO — FEATURES DE CORRELAÇÃO CRUZADA (índice de ração / margem insumo)
+# NOVO — FEATURES DE CORRELAÇÃO CRUZADA (índice de insumo / margem insumo)
 # ==============================================================================
+# Generalizado para QUALQUER cluster de receita em MAPA_RECEITA — não apenas
+# ração (Wheat/Corn/Barley). Cada item usa o índice da SUA PRÓPRIA combinação
+# de insumos (ex.: Egg → Wheat+Corn+Barley; Iron → Wood+Stone), com peso igual
+# entre os insumos presentes. Itens que compartilham a mesma lista de insumos
+# (ex.: Egg/Feather/Milk/Leather/Wool/Merino Wool) reaproveitam o mesmo índice
+# já calculado, em vez de recalcular o pivot/merge do zero para cada um —
+# indexado pela tupla ordenada de insumos, não pelo nome do item.
+#
+# Para a cadeia de minério (Stone←Wood; Iron←Wood+Stone; Gold←Wood+Iron;
+# Crimstone←Wood+Gold): cada elo usa o preço de MERCADO do elo anterior
+# diretamente como insumo, sem decompor recursivamente até a matéria-prima
+# final — o preço de mercado do insumo já embute seu próprio custo/escassez,
+# igual à premissa já usada no cluster de ração.
 
-def construir_indice_racao(df_bruto):
+def construir_indices_insumos(df_bruto, mapa_receita=MAPA_RECEITA):
     """
-    Índice de custo de ração: combinação ponderada de Wheat/Corn/Barley por
-    timestamp. Retorna DataFrame [Timestamp, Indice_Racao] pronto para merge
-    com o histórico de qualquer item que dependa de ração (MAPA_RECEITA).
+    Constrói, para cada combinação ÚNICA de insumos presente em mapa_receita,
+    um índice de preço (média simples, peso igual, com ffill em gaps
+    pontuais de coleta). Retorna dict {tupla_insumos_ordenada: DataFrame[Timestamp, Indice_Insumo]}.
+
+    Chamado 1x por ciclo, antes do loop de itens — assim itens com a mesma
+    lista de insumos não recalculam o mesmo índice repetidamente.
     """
-    itens_racao = list(PESOS_RACAO.keys())
-    df_racao = df_bruto[df_bruto['Item'].isin(itens_racao)].copy()
-    if df_racao.empty:
-        return pd.DataFrame(columns=['Timestamp', 'Indice_Racao'])
+    indices = {}
+    combinacoes_unicas = {tuple(sorted(insumos)) for insumos in mapa_receita.values()}
 
-    df_racao['Timestamp'] = pd.to_datetime(df_racao['Timestamp'], dayfirst=True, errors='coerce')
-    df_racao = df_racao.dropna(subset=['Timestamp'])
+    for combo in combinacoes_unicas:
+        df_insumos = df_bruto[df_bruto['Item'].isin(combo)].copy()
+        if df_insumos.empty:
+            continue
 
-    pivot = df_racao.pivot_table(index='Timestamp', columns='Item', values='Price', aggfunc='last')
-    pivot = pivot.reindex(columns=itens_racao)
-    pivot = pivot.sort_index().ffill()   # preenche gaps pontuais de coleta
+        df_insumos['Timestamp'] = pd.to_datetime(df_insumos['Timestamp'], dayfirst=True, errors='coerce')
+        df_insumos = df_insumos.dropna(subset=['Timestamp'])
+        if df_insumos.empty:
+            continue
 
-    indice = sum(pivot[item] * peso for item, peso in PESOS_RACAO.items() if item in pivot.columns)
-    return indice.rename('Indice_Racao').reset_index()
+        pivot = df_insumos.pivot_table(index='Timestamp', columns='Item', values='Price', aggfunc='last')
+        pivot = pivot.reindex(columns=list(combo))
+        pivot = pivot.sort_index().ffill()   # preenche gaps pontuais de coleta
+
+        # Peso igual entre os insumos do grupo. mean(skipna=True) em vez de
+        # exigir todas as colunas presentes — um insumo sem histórico ainda
+        # (ex.: item novo no jogo) não derruba o índice inteiro para NaN,
+        # só é ignorado até ter dados.
+        indice = pivot.mean(axis=1, skipna=True)
+        indices[combo] = indice.rename('Indice_Insumo').reset_index()
+
+    return indices
 
 
-def adicionar_features_correlacao(d_item, item, df_indice_racao):
+def adicionar_features_correlacao(d_item, item, indices_insumos, mapa_receita=MAPA_RECEITA):
     """
-    Adiciona Indice_Racao e Margem_Insumo (preço do item / índice de ração)
-    ao DataFrame de indicadores do item, se ele depender de ração conforme
-    MAPA_RECEITA. NaN para itens fora do mapa — XGBoost trata como valor
-    ausente nativamente, sem quebrar o treino/inferência.
+    Adiciona Indice_Insumo e Margem_Insumo (preço do item / índice dos seus
+    próprios insumos, conforme mapa_receita) ao DataFrame de indicadores do
+    item. NaN para itens fora do mapa, ou sem histórico de insumo suficiente
+    ainda — XGBoost trata como valor ausente nativamente, sem quebrar o
+    treino/inferência.
     """
     d_item = d_item.copy()
 
-    if item not in MAPA_RECEITA or df_indice_racao.empty:
-        d_item['Indice_Racao'] = np.nan
+    if item not in mapa_receita:
+        d_item['Indice_Insumo'] = np.nan
         d_item['Margem_Insumo'] = np.nan
         return d_item
 
-    insumos_item = set(MAPA_RECEITA[item])
-    if not insumos_item.issubset(set(PESOS_RACAO.keys())):
-        # Receita não baseada em ração (ex.: Gold <- Wood+Stone) — fica fora
-        # do índice de ração por ora.
-        # TODO: índice de custo separado por cluster de receita quando
-        # houver mais itens desse tipo (ex.: índice Wood+Stone para Gold).
-        d_item['Indice_Racao'] = np.nan
+    combo = tuple(sorted(mapa_receita[item]))
+    df_indice = indices_insumos.get(combo)
+
+    if df_indice is None or df_indice.empty:
+        d_item['Indice_Insumo'] = np.nan
         d_item['Margem_Insumo'] = np.nan
         return d_item
 
     # Remove os placeholders NaN (já criados em _calcular_indicadores_do_zero)
     # antes do merge — senão merge_asof colide com a coluna de mesmo nome
-    # vinda de df_indice_racao (gera Indice_Racao_x/_y em vez de preencher a
+    # vinda de df_indice (gera Indice_Insumo_x/_y em vez de preencher a
     # coluna esperada, e o KeyError aparece mais adiante quando X_COLS_POOLED
-    # tenta acessar 'Indice_Racao').
-    d_item = d_item.drop(columns=['Indice_Racao', 'Margem_Insumo'], errors='ignore')
+    # tenta acessar 'Indice_Insumo').
+    d_item = d_item.drop(columns=['Indice_Insumo', 'Margem_Insumo'], errors='ignore')
 
     d_item = pd.merge_asof(
         d_item.sort_values('Timestamp'),
-        df_indice_racao.sort_values('Timestamp'),
+        df_indice.sort_values('Timestamp'),
         on='Timestamp', direction='nearest', tolerance=pd.Timedelta('2h')
     )
     d_item['Margem_Insumo'] = d_item.apply(
-        lambda r: (r['Price'] / r['Indice_Racao']) if r.get('Indice_Racao', 0) else np.nan, axis=1
+        lambda r: (r['Price'] / r['Indice_Insumo']) if r.get('Indice_Insumo', 0) else np.nan, axis=1
     )
     return d_item
 
@@ -1330,7 +1366,7 @@ n_obs_rl_map = contar_obs_por_estado(df_val)
 # 2. INDICADORES (via cache incremental) + FEATURES DE CORRELAÇÃO
 # ==============================================================================
 cache_indicadores_persistido = carregar_cache_indicadores()
-df_indice_racao = construir_indice_racao(df_bruto)
+indices_insumos = construir_indices_insumos(df_bruto)
 
 cache_indicadores = {}
 for item in df_bruto['Item'].unique():
@@ -1338,7 +1374,7 @@ for item in df_bruto['Item'].unique():
         d_it = preparar_indicadores_incremental(df_bruto, item, cache_indicadores_persistido)
         if d_it.empty:
             continue
-        d_it = adicionar_features_correlacao(d_it, item, df_indice_racao)
+        d_it = adicionar_features_correlacao(d_it, item, indices_insumos)
         cache_indicadores[item] = d_it
         # Propaga de volta pro cache persistido (que só guarda as colunas
         # base — correlação é recalculada a cada ciclo por ser barata)
