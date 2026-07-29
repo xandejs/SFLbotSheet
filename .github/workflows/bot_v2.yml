@@ -11,11 +11,11 @@ on:
   # é mais barato sem confirmar.
   workflow_dispatch:
 
-  schedule:
+  # schedule:
     # A cada 2h, no minuto 17 — evita o pico de carga do minuto :00 e não
     # coincide com o minuto 11 do cron de produção (V1), reduzindo a chance
     # de dois jobs de bot competindo por runner ao mesmo tempo.
-    - cron: '17 */2 * * *'
+  #  - cron: '17 */2 * * *'
 
 jobs:
   rodar-bot-v2:
