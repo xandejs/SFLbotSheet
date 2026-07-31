@@ -1494,10 +1494,10 @@ novas_linhas_validacao = []
 lista_final = []
 
 mapa_ultimo_sinal = {}
-usar_dedup_simples = False
+linhas_ignoradas_dedup = 0
 if not df_val.empty:
-    try:
-        for _, row_u in df_val.iterrows():
+    for _, row_u in df_val.iterrows():
+        try:
             chave_u = f"{str(row_u['Item']).strip()}_{str(row_u['Tipo']).strip().upper()}"
             ts_u = parse_data_sinal_robusta(row_u['Data_Sinal'])
             if pd.isnull(ts_u):
@@ -1505,10 +1505,20 @@ if not df_val.empty:
             preco_u = limpar_numero(row_u['Preco_Sinal'])
             if chave_u not in mapa_ultimo_sinal or ts_u > mapa_ultimo_sinal[chave_u]['timestamp']:
                 mapa_ultimo_sinal[chave_u] = {'preco': preco_u, 'timestamp': ts_u}
-    except Exception as e:
-        print(f"⚠️  mapa_ultimo_sinal (V2) falhou: {e} — revertendo para deduplicação por data.")
-        mapa_ultimo_sinal = {}
-        usar_dedup_simples = True
+        except Exception as e:
+            # Isolado por linha: uma linha corrompida (data num formato
+            # inesperado, campo ausente, etc.) só é pulada — antes, uma única
+            # linha ruim em Validacao_Sinais derrubava o loop inteiro e
+            # forçava usar_dedup_simples=True para TODOS os itens do ciclo,
+            # o que troca silenciosamente a janela deslizante de 4h/3% por
+            # "1 sinal por item por dia-calendário BRT" (reset à meia-noite).
+            linhas_ignoradas_dedup += 1
+            continue
+
+if linhas_ignoradas_dedup > 0:
+    print(f"⚠️  {linhas_ignoradas_dedup} linha(s) de Validacao_Sinais (V2) ignorada(s) ao "
+          f"montar mapa_ultimo_sinal (dado corrompido) — dedup de 4h/3% seguiu normal "
+          f"para as demais linhas, sem cair no fallback por data.")
 
 for item in df_ranking['Item']:
     d_it = cache_indicadores.get(item)
@@ -1628,11 +1638,6 @@ for item in df_ranking['Item']:
 
         if pode_gerar:
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
-                if usar_dedup_simples:
-                    chave_fallback = f"{item}_{tipo_sinal}_{dt_hoje_str}{sufixo}"
-                    if not df_val.empty and df_val['Chave_Unica'].astype(str).str.startswith(chave_fallback).any():
-                        continue
-
                 linha_sinais_hoje = len(lista_final)
                 enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
 
