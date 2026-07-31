@@ -2,7 +2,7 @@ name: SFL YieldMaster AI
 
 on:
   schedule:
-    - cron: '15 * * * *'   # :11 de cada hora — evita pico de carga do GitHub no :00
+    - cron: '15 */2 * * *'   # :11 de cada hora — evita pico de carga do GitHub no :00
   workflow_dispatch:         # execução manual mantida
 
 jobs:
