@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     # Ajuste após medir o custo real via workflow_dispatch manual — este é um
     # valor de partida conservador, não uma medição.
-    timeout-minutes: 20
+    timeout-minutes: 5
 
     steps:
       - name: Checkout do repositório
