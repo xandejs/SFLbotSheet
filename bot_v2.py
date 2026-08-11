@@ -124,6 +124,16 @@ X_COLS_POOLED = X_COLS_BASE + X_COLS_CORRELACAO
 # quebrar o ciclo, só mais lento naquela execução específica.
 CACHE_DIR = "cache_v2"
 CACHE_INDICADORES_PATH = os.path.join(CACHE_DIR, "indicadores_incrementais.pkl")
+
+# Log de diagnóstico opt-in: grava, para TODO item em TODO ciclo (não só
+# quando um sinal é gerado), o valor de alvo_in/alvo_out, os dois pontos de
+# veto (manual e RL) e a decisão final. Usado para investigar por que um
+# item cumpre a condição de banda mas não vira sinal em Validacao_Sinais —
+# ver aba Debug_Decisao. Desligado por padrão porque gera ~65 linhas/ciclo;
+# ativar via variável de ambiente DEBUG_DECISOES=1 no workflow só enquanto
+# for necessário depurar, depois desligar de novo.
+DEBUG_DECISOES = os.environ.get("DEBUG_DECISOES", "0") == "1"
+DEBUG_DECISOES_PATH = "Debug_Decisao"
 MODELO_POOLED_PATH = os.path.join(CACHE_DIR, "modelo_pooled.json")
 MODELO_POOLED_META_PATH = os.path.join(CACHE_DIR, "modelo_pooled_meta.pkl")
 
@@ -1492,6 +1502,7 @@ except Exception:
 prox_id_sinal = max_id_existente + 1
 novas_linhas_validacao = []
 lista_final = []
+debug_linhas = []
 
 mapa_ultimo_sinal = {}
 linhas_ignoradas_dedup = 0
@@ -1572,6 +1583,7 @@ for item in df_ranking['Item']:
         acao = "🔴 VENDER (Lucro Disponível)" if (origem == 2 and alvo_lucro > alvo_out_estatistico) else "🔴 VENDER"
     elif preco_atual >= alvo_out - margem_atencao:
         acao = "🎯 PERTO DA SAÍDA"
+    acao_banda = acao   # decisão pura de banda, antes de stop/veto/crash
 
     if origem == 2 and preco_atual < custo_medio:
         deve_stopar, _thr_stop = calcular_stop_adaptativo(item, preco_atual, roi_pred / 100, df_audit_mem=df_audit_cache)
@@ -1579,11 +1591,16 @@ for item in df_ranking['Item']:
             acao = "⚠️ VENDER (Stop Loss)"
         elif acao == "ESPERAR":
             acao = "ESPERAR (Prejuízo)"
+    acao_pos_stop = acao
 
-    if acao == "🟢 COMPRAR" and mapa_veto.get(item, False):
+    veto_manual = bool(mapa_veto.get(item, False))
+    if acao == "🟢 COMPRAR" and veto_manual:
         acao = "🚫 COMPRA VETADA"
 
     roi_pred_exibido = roi_pred
+    vetado_rl = False
+    q_compra_item = None
+    n_obs_item_at = None
     if acao == "🟢 COMPRAR":
         chave_ci_atual = f"{item}|{estado_rl}"
         q_item_dados = q_table_item.get(chave_ci_atual, {})
@@ -1600,6 +1617,28 @@ for item in df_ranking['Item']:
     em_crash, var24h = detectar_regime(cache_indicadores.get(item))
     if em_crash and "COMPRAR" in acao:
         acao = f"⚠️ COMPRAR (QUEDA {var24h:.1f}% em 24h)"
+
+    if DEBUG_DECISOES:
+        chave_tipo_dbg = f"{item}_COMPRA" if "COMPRAR" in acao_banda else (f"{item}_VENDA" if "VENDER" in acao_banda else None)
+        ultimo_dbg = mapa_ultimo_sinal.get(chave_tipo_dbg) if chave_tipo_dbg else None
+        if ultimo_dbg:
+            horas_desde_dbg = round((obter_agora_brt() - ultimo_dbg['timestamp']).total_seconds() / 3600, 2)
+            variacao_dbg = round(abs(preco_atual - ultimo_dbg['preco']) / ultimo_dbg['preco'] * 100, 2) if ultimo_dbg['preco'] > 0 else None
+        else:
+            horas_desde_dbg, variacao_dbg = None, None
+
+        debug_linhas.append([
+            obter_agora_brt().strftime("%d/%m/%Y %H:%M"), item,
+            round(preco_atual, 4), round(row['Media_Macro'], 4), round(row['Desvio_Macro'], 4),
+            round(alvo_in, 4), round(alvo_out, 4),
+            saldo_item, "Revenda" if origem == 2 else "Colheita",
+            acao_banda, acao_pos_stop,
+            veto_manual, vetado_rl, bool(em_crash),
+            acao,
+            horas_desde_dbg, variacao_dbg,
+        ])
+
+
 
     lista_final.append([
         item,
@@ -1712,6 +1751,47 @@ try:
         print("📊 XGB_Audit (V2): nenhum item com dados suficientes para auditoria.")
 except Exception as e:
     print(f"❌ Erro ao salvar XGB_Audit (V2): {e}")
+
+# --- Debug_Decisao (opt-in via DEBUG_DECISOES=1) ---
+# Uma linha por item por ciclo, mesmo sem sinal — para investigar por que um
+# item que cumpre a condição de banda não vira sinal em Validacao_Sinais:
+# permite distinguir "acao_banda" (decisão pura banda) de "acao_final" (após
+# stop-loss, veto manual, veto do Cérebro RL, e regime de crash), sem
+# precisar reconstruir Media_Macro/Desvio_Macro às cegas a partir do RecLog.
+if DEBUG_DECISOES:
+    HEADERS_DEBUG = [
+        "Timestamp", "Item", "Preco_Atual", "Media_Macro", "Desvio_Macro",
+        "Alvo_In", "Alvo_Out", "Saldo_Item", "Origem",
+        "Acao_Banda", "Acao_Pos_Stop", "Veto_Manual", "Vetado_RL", "Em_Crash",
+        "Acao_Final", "Horas_Desde_Ultimo_Sinal_Mesmo_Tipo", "Variacao_Pct_Vs_Ultimo",
+    ]
+    try:
+        try:
+            ws_debug = sh.worksheet(DEBUG_DECISOES_PATH)
+        except Exception:
+            n_itens_init = df_bruto['Item'].nunique()
+            rows_init = n_itens_init * 72 * 2 + 500
+            ws_debug = sh.add_worksheet(title=DEBUG_DECISOES_PATH, rows=str(rows_init), cols=str(len(HEADERS_DEBUG)))
+            ws_debug.update(values=[HEADERS_DEBUG], range_name='A1', value_input_option='USER_ENTERED')
+            set_frozen(ws_debug, rows=1)
+            format_cell_range(ws_debug, f'A1:{chr(64+len(HEADERS_DEBUG))}1', CellFormat(textFormat=TextFormat(bold=True)))
+
+        JANELA_DEBUG_H = 72   # mesma janela de retenção do XGB_Audit — só o necessário pra depurar
+        n_itens_reais = df_bruto['Item'].nunique()
+        RETENCAO_DEBUG = n_itens_reais * JANELA_DEBUG_H
+
+        if debug_linhas:
+            dados_atuais = ws_debug.get_all_values()
+            header = dados_atuais[0] if dados_atuais else HEADERS_DEBUG
+            linhas_existentes = dados_atuais[1:] if len(dados_atuais) > 1 else []
+            todas = linhas_existentes + debug_linhas
+            if len(todas) > RETENCAO_DEBUG:
+                todas = todas[-RETENCAO_DEBUG:]
+            ws_debug.clear()
+            ws_debug.update(values=([header] + todas), range_name='A1', value_input_option='USER_ENTERED')
+            print(f"🔍 Debug_Decisao: {len(debug_linhas)} novas | {len(todas)} retidas.")
+    except Exception as e:
+        print(f"❌ Erro ao salvar Debug_Decisao: {e}")
 
 try:
     cerebro_linhas = [
