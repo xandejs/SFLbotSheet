@@ -68,5 +68,8 @@ jobs:
         # planilha nova (compartilhe SFL 2025_10_V2 com o e-mail da service account).
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credenciais_robo.json
 
-      - name: Executar bot_v2.py
+      - name: Executar bot V2
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          DEBUG_DECISOES: "1"
         run: python bot_v2.py
