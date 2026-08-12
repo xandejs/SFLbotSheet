@@ -169,9 +169,7 @@ def obter_agora_brt():
 
 def enviar_telegram(acao, ativo, preco, linha):
     """
-    Alerta via Telegram, com prefixo [V2 SOMBRA] para diferenciar visualmente
-    dos alertas reais da produção (V1) — evita confundir o que é sinal de
-    verdade com o que é observação da fase sombra.
+    Alerta via Telegram
     """
     token = "8715722660:AAGgJSl2w2RpM0kxZ9Y4MFK4lHpDZaLyQmw"
     chat_id = "873167793"
@@ -188,8 +186,8 @@ def enviar_telegram(acao, ativo, preco, linha):
     hora_formatada = obter_agora_brt().strftime("%d/%m %H:%M:%S")
 
     mensagem = (
-        f"🧪 [V2 SOMBRA — não executar] 🧪\n"
-        f"{emoji} *ALERTA DE OPERAÇÃO (V2)* {emoji}\n\n"
+
+        f"{emoji} *ALERTA DE OPERAÇÃO* {emoji}\n\n"
         f"*Ação:* {acao.upper()}\n"
         f"*Ativo:* {ativo}\n"
         f"*Preço:* {preco_formatado}\n"
