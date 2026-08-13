@@ -7,15 +7,14 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ==============================================================================
 # CONFIGURAÇÕES
 # ==============================================================================
-NOME_PLANILHA = "SFL 2025_10"
+NOME_PLANILHA = "SFL 2025_10_V2"
 
 # Defina aqui todas as abas que você deseja fazer backup
 ABAS_PARA_BACKUP = [
     "Cerebro_RL",
     "Validacao_Sinais",
     "Cerebro_RL_Item",
-    "Alocacao_Recursos",
-    "RecLog"              # Adicione quantas abas precisar aqui
+    "Alocacao_Recursos"  # Adicione quantas abas precisar aqui
 ]
 
 PASTA_BACKUP = "backups_cerebro"
