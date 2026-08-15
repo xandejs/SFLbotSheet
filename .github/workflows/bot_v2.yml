@@ -71,5 +71,5 @@ jobs:
       - name: Executar bot V2
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          DEBUG_DECISOES: "1"
+         # DEBUG_DECISOES: "1"
         run: python bot_v2.py
