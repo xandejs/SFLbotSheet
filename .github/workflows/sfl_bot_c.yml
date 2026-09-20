@@ -1,0 +1,82 @@
+name: SFL Bot C (Teste de Performance)
+
+# Roda o porte experimental em C — não decide capital real, é só para
+# medir tempo de ciclo real em runner do Actions (rede + cálculo), fora
+# do meu sandbox local. Workflow separado dos de produção (V1) e sombra
+# (V2): cron independente, sem risco de concorrência de job.
+
+on:
+  # Rode manualmente algumas vezes antes de cogitar um cron — o objetivo
+  # aqui é medir, não automatizar ainda (mesmo princípio do bot_v2.yml).
+  workflow_dispatch:
+
+  # schedule:
+  #   - cron: '23 */2 * * *'   # minuto/cadência de sobra — ajuste depois de medir
+
+jobs:
+  rodar-bot-c:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # ---- Dependências de sistema (curl, ssl, cjson, toolchain) ----
+      - name: Cache do apt
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-c-bot-v1
+
+      - name: Instalar dependências de build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev libcjson-dev
+
+      # ---- XGBoost: usamos a libxgboost.so que vem no wheel do pip em vez
+      # de compilar o XGBoost do zero (muito mais rápido no runner) ----
+      - name: Configurar Python (só para obter libxgboost.so)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache do pip (xgboost)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-xgboost-c-bot
+
+      - name: Instalar xgboost (fonte da libxgboost.so)
+        run: pip install xgboost
+
+      - name: Criar symlink versionado da libxgboost.so
+        # O binário linka contra o SONAME embutido (ex.: libxgboost.so.3),
+        # que não existe por padrão no wheel do pip — sem isso o binário
+        # falha em tempo de execução com "cannot open shared object file".
+        run: |
+          XGDIR=$(python3 -c "import xgboost, os; print(os.path.dirname(xgboost.__file__) + '/lib')")
+          SONAME=$(objdump -p "$XGDIR/libxgboost.so" | grep SONAME | awk '{print $2}')
+          echo "XGDIR=$XGDIR" >> "$GITHUB_ENV"
+          if [ -n "$SONAME" ] && [ ! -e "$XGDIR/$SONAME" ]; then
+            ln -sf "$XGDIR/libxgboost.so" "$XGDIR/$SONAME"
+          fi
+
+      # ---- Build ----
+      - name: Compilar (make)
+        run: make
+        working-directory: sfl_bot_c   # ajuste se o projeto estiver em outra pasta do repo
+
+      # ---- Credenciais Google ----
+      - name: Credenciais Google
+        # Mesmo secret já usado pelos workflows de produção/sombra —
+        # reaproveita a mesma service account (já compartilhada com a
+        # planilha "SFL 2025_10").
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > sfl_bot_c/credenciais_robo.json
+
+      # ---- Execução ----
+      - name: Executar sfl_bot (C)
+        run: ./build/sfl_bot
+        working-directory: sfl_bot_c
+        env:
+          LD_LIBRARY_PATH: ${{ env.XGDIR }}
