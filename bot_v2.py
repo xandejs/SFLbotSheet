@@ -45,12 +45,65 @@ import numpy as np
 import xgboost as xgb
 import gspread
 import os
+import time
 import math
 import pickle
 import requests
 from datetime import datetime, timedelta, timezone
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_formatting import set_frozen, format_cell_range, CellFormat, TextFormat
+
+# ─── Trava de leitura do RecLog (handshake com TRAVA_BOT.gs) ─────────────────
+# Enquanto o bot lê o RecLog, o Apps Script não grava nem deleta linhas nele.
+# Protocolo: "adquirir" → lê (UMA chamada get_all_values = snapshot) → "liberar".
+# Secrets do GitHub: TRAVA_URL (URL /exec do app da web) e TRAVA_TOKEN (= BOT_TOKEN).
+TRAVA_URL   = os.environ.get("TRAVA_URL", "")
+TRAVA_TOKEN = os.environ.get("TRAVA_TOKEN", "")
+TRAVA_TTL_SEGURO_S = 240   # TTL no Apps Script é 300 s; passou disso, relê com trava nova
+
+
+def _chamar_trava(acao, tentativas=3, timeout=90):
+    """POST ao app da web do Apps Script. Levanta RuntimeError se não confirmar."""
+    ultimo_erro = None
+    for i in range(1, tentativas + 1):
+        try:
+            r = requests.post(TRAVA_URL, json={"token": TRAVA_TOKEN, "acao": acao}, timeout=timeout)
+            r.raise_for_status()
+            resp = r.json()
+            if not resp.get("ok"):
+                raise RuntimeError(f"resposta negativa: {resp.get('erro')}")
+            return resp
+        except Exception as e:
+            ultimo_erro = e
+            print(f"⚠️ Trava '{acao}' tentativa {i}/{tentativas} falhou: {e}")
+            if i < tentativas:
+                time.sleep(3 * i)
+    raise RuntimeError(f"Trava '{acao}' falhou após {tentativas} tentativas: {ultimo_erro}")
+
+
+def ler_reclog_travado(planilha):
+    """Lê o RecLog (sem o cabeçalho) com o Apps Script impedido de gravar/deletar nele."""
+    if not TRAVA_URL or not TRAVA_TOKEN:
+        if os.environ.get("GITHUB_ACTIONS"):
+            # Fail closed: no Actions, sem trava configurada não lê.
+            raise RuntimeError("TRAVA_URL/TRAVA_TOKEN ausentes — leitura do RecLog abortada.")
+        print("⚠️ TRAVA_URL/TRAVA_TOKEN ausentes (execução local): lendo RecLog SEM proteção.")
+        return planilha.worksheet("RecLog").get_all_values()[1:]
+
+    for tentativa in (1, 2):
+        _chamar_trava("adquirir")
+        t0 = time.time()
+        try:
+            dados = planilha.worksheet("RecLog").get_all_values()
+        finally:
+            try:
+                _chamar_trava("liberar")
+            except Exception as e:
+                print(f"⚠️ Não consegui liberar a trava (expira sozinha em ~5 min): {e}")
+        if time.time() - t0 <= TRAVA_TTL_SEGURO_S:
+            return dados[1:]
+        print(f"⚠️ Leitura do RecLog passou de {TRAVA_TTL_SEGURO_S}s (tentativa {tentativa}); relendo com trava nova.")
+    raise RuntimeError("Leitura do RecLog excedeu o TTL da trava duas vezes.")
 
 # ==============================================================================
 # CONFIGURAÇÕES E CONSTANTES
@@ -1076,7 +1129,7 @@ compras_log = df_trade[df_trade['Tipo'].str.contains("Compra", case=False)].grou
     .apply(lambda x: sum(map(limpar_numero, x))).to_dict()
 mapa_custo_fifo = calcular_fifo_hibrido(df_trade, inv_dict)
 
-rec_data = sh_origem.worksheet("RecLog").get_all_values()[1:]
+rec_data = ler_reclog_travado(sh_origem)
 df_bruto = pd.DataFrame([l[:4] for l in rec_data], columns=['Timestamp', 'Item', 'Price', 'Season'])
 df_bruto['Price'] = df_bruto['Price'].apply(limpar_numero)
 
