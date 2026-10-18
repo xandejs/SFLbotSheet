@@ -71,5 +71,20 @@ jobs:
       - name: Executar bot V2
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          TRAVA_URL: ${{ secrets.TRAVA_URL }}
+          TRAVA_TOKEN: ${{ secrets.TRAVA_TOKEN }}
          # DEBUG_DECISOES: "1"
         run: python bot_v2.py
+
+      - name: Liberar trava do RecLog (segurança)
+        # Roda mesmo se o bot falhar/for cancelado. O bot já libera logo após ler;
+        # isto cobre crash entre "adquirir" e "liberar". Se nem isto rodar, a trava
+        # expira sozinha no Apps Script (TTL de 5 min).
+        if: always()
+        env:
+          TRAVA_URL: ${{ secrets.TRAVA_URL }}
+          TRAVA_TOKEN: ${{ secrets.TRAVA_TOKEN }}
+        run: |
+          curl -sL --max-time 60 -X POST "$TRAVA_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"token\":\"$TRAVA_TOKEN\",\"acao\":\"liberar\"}" || true
