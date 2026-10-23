@@ -717,6 +717,30 @@ def _calcular_indicadores_do_zero(d_bruto_item, nome_item):
     return d
 
 
+def _recalcular_alvos_e_pesos(d):
+    """
+    Recalcula Preco_Futuro e Peso_Temporal sobre o histórico COMPLETO.
+
+    Por que não dá para cachear essas duas colunas:
+      - Preco_Futuro = Price.shift(-SHIFT_ALVO) olha 288 linhas para a
+        FRENTE. Uma linha calculada quando estava entre as últimas 288 do
+        histórico nasce com NaN, e só ganha valor quando 288 linhas novas
+        chegarem depois dela. Se o cache só anexa linhas novas, esse NaN
+        nunca é preenchido e o treino fica congelado na data em que o
+        cache foi criado.
+      - Peso_Temporal depende de max_date (a data mais recente do
+        histórico), que muda a cada ciclo — o valor antigo fica defasado.
+
+    Ambos são operações vetorizadas e baratas, então rodar sobre o df
+    inteiro em todo ciclo não pesa no runtime.
+    """
+    d = d.copy()
+    d['Preco_Futuro'] = d['Price'].shift(-SHIFT_ALVO)
+    max_date = d['Timestamp'].max()
+    d['Peso_Temporal'] = np.exp(-0.01 * (max_date - d['Timestamp']).dt.days)
+    return d
+
+
 def _atribuir_holdout(d):
     """
     Marca is_holdout (3 janelas de 72h) sobre o histórico COMPLETO — precisa
@@ -757,6 +781,11 @@ def preparar_indicadores_incremental(df_bruto_geral, nome_item, cache):
     linhas novas desde o último ciclo precisam ser calculadas. Isso evita
     reprocessar o histórico inteiro (que só cresce) a cada execução.
 
+    EXCEÇÃO: Preco_Futuro e Peso_Temporal dependem do histórico completo
+    (ver _recalcular_alvos_e_pesos) e são recalculados sobre o df inteiro
+    em todo ciclo — inclusive quando não há linhas novas, o que também
+    cura caches antigos que ficaram com esses campos defasados.
+
     cache[item] = {"df": DataFrame já processado, "ultimo_ts": Timestamp}
     """
     d_bruto_item = df_bruto_geral[df_bruto_geral['Item'] == nome_item].copy()
@@ -768,8 +797,14 @@ def preparar_indicadores_incremental(df_bruto_geral, nome_item, cache):
 
     ultimo_ts_global = d_bruto_item['Timestamp'].max()
     cache_item = cache.get(nome_item)
+    janela_micro_dinamica = 10 * REGISTROS_POR_DIA
 
-    if not cache_item or cache_item.get('df') is None or cache_item['df'].empty:
+    # Sem cache, ou cache de um item ainda "curto" (< 240 linhas): nesse caso
+    # _calcular_indicadores_do_zero retornou cedo, com todos os indicadores
+    # NaN. Anexar só linhas novas deixaria essas linhas antigas NaN para
+    # sempre, então recalcula do zero até o item ter histórico suficiente.
+    if (not cache_item or cache_item.get('df') is None or cache_item['df'].empty
+            or len(cache_item['df']) < janela_micro_dinamica):
         d_full = _calcular_indicadores_do_zero(d_bruto_item, nome_item)
         d_full = _atribuir_holdout(d_full)
         cache[nome_item] = {'df': d_full, 'ultimo_ts': ultimo_ts_global}
@@ -779,7 +814,10 @@ def preparar_indicadores_incremental(df_bruto_geral, nome_item, cache):
     linhas_novas = d_bruto_item[d_bruto_item['Timestamp'] > ultimo_ts_cache]
 
     if linhas_novas.empty:
-        return cache_item['df']
+        d_full = _recalcular_alvos_e_pesos(cache_item['df'])
+        d_full = _atribuir_holdout(d_full)
+        cache[nome_item] = {'df': d_full, 'ultimo_ts': ultimo_ts_cache}
+        return d_full
 
     janela_macro_dinamica = 30 * REGISTROS_POR_DIA
     contexto = d_bruto_item[d_bruto_item['Timestamp'] <= ultimo_ts_cache].tail(janela_macro_dinamica)
@@ -788,6 +826,10 @@ def preparar_indicadores_incremental(df_bruto_geral, nome_item, cache):
     novas_processadas = bloco_processado[bloco_processado['Timestamp'] > ultimo_ts_cache]
 
     d_full = pd.concat([cache_item['df'], novas_processadas], ignore_index=True)
+    # Preco_Futuro/Peso_Temporal precisam ser refeitos sobre o histórico
+    # inteiro — os valores vindos de novas_processadas (e os antigos do
+    # cache) estão incompletos/defasados.
+    d_full = _recalcular_alvos_e_pesos(d_full)
     d_full = _atribuir_holdout(d_full)
 
     cache[nome_item] = {'df': d_full, 'ultimo_ts': ultimo_ts_global}
@@ -1345,15 +1387,18 @@ if not df_val.empty:
         print(f"🧠 Cérebro RL (V2) atualizado: {len(df_reforco)} novos estados processados.")
 
 # ==============================================================================
-# NOVO: Calibração híbrida (idêntica em lógica, lendo XGB_Audit da V2)
+# Calibração híbrida (mesma lógica do V1: FONTE 1 = sinais reais, FONTE 2 =
+# proxy por MAE do XGB_Audit para itens sem histórico de sinais concluídos)
 # ==============================================================================
 
 def construir_calibracao_hibrida_v2(sh_v2, df_bruto_local, df_val_mem=None, q_table_mem=None):
     mapa_mult = {}
     mapa_veto_local = {}
     mapa_roi = {}
+    _confianca = {}   # metadado interno: 0.0 (só proxy) a 1.0 (só histórico real)
     df_audit_retorno = pd.DataFrame(columns=HEADERS_AUDIT)
 
+    # FONTE 1: taxa de acerto real (Validacao_Sinais)
     if df_val_mem is not None and not df_val_mem.empty:
         df_concluidos = df_val_mem[df_val_mem['Status'].str.contains("🏆|❌|💰", na=False)].copy()
         if not df_concluidos.empty:
@@ -1361,10 +1406,20 @@ def construir_calibracao_hibrida_v2(sh_v2, df_bruto_local, df_val_mem=None, q_ta
             calibrar_por_taxa_confianca(df_val_mem, mapa_mult, mapa_roi, mapa_veto_local)
             print(f"📈 Calibração Bayesiana (V2): {df_concluidos['Item'].nunique()} itens | "
                   f"{len(df_concluidos)} sinais concluídos.")
+
+            # Necessário para que a FONTE 2 calcule peso_xgb corretamente
+            # (sem isso, peso_xgb = 1 - _confianca.get(item, 1.0) = 0 para
+            # itens com histórico real, anulando o ajuste de MAE).
+            for item_c, group in df_concluidos.groupby('Item'):
+                _confianca[item_c] = min(1.0, len(group) / 10.0)
         else:
             print("ℹ️  Calibração (V2): nenhum sinal concluído ainda — fase bootstrap.")
     else:
         print("ℹ️  Calibração (V2): Validacao_Sinais vazia — fase bootstrap.")
+
+    # FONTE 2: MAE do XGBoost (XGB_Audit da V2) — proxy de curto prazo para
+    # itens sem sinais concluídos
+    JANELA_AUDIT = 72   # últimas 72 horas de ciclos
 
     try:
         ws_audit = sh_v2.worksheet("XGB_Audit")
@@ -1374,6 +1429,43 @@ def construir_calibracao_hibrida_v2(sh_v2, df_bruto_local, df_val_mem=None, q_ta
             df_audit['MAE'] = df_audit['MAE'].apply(limpar_numero)
             df_audit['Acerto_Direcao_%'] = df_audit['Acerto_Direcao_%'].apply(limpar_numero)
             df_audit_retorno = df_audit.copy()
+
+            df_audit_proxy = df_audit[df_audit['MAE'] > 0].copy()
+
+            n_proxy = 0
+            for item_a, grupo in df_audit_proxy.groupby('Item'):
+                ultimos = grupo.tail(JANELA_AUDIT)
+                mae_medio = ultimos['MAE'].mean()
+                acerto_medio = ultimos['Acerto_Direcao_%'].mean()
+
+                preco_medio = df_bruto_local[df_bruto_local['Item'] == item_a]['Price'].tail(240).mean()
+                mae_relativo = (mae_medio / preco_medio) if preco_medio > 0 else 0.15
+
+                if item_a not in mapa_mult:
+                    # Sem histórico real → MAE como único sinal de confiança
+                    if mae_relativo < 0.05 and acerto_medio >= 60:
+                        mapa_mult[item_a] = 2.0
+                        mapa_roi[item_a] = 0.0
+                        mapa_veto_local[item_a] = False
+                    elif mae_relativo < 0.12:
+                        mapa_mult[item_a] = 2.4
+                        mapa_roi[item_a] = -3.0
+                        mapa_veto_local[item_a] = False
+                    else:
+                        # Modelo impreciso → bandas largas, sem veto (sem evidência real ainda)
+                        mapa_mult[item_a] = 2.8
+                        mapa_roi[item_a] = -6.0
+                        mapa_veto_local[item_a] = False
+                    _confianca[item_a] = 0.0
+                    n_proxy += 1
+                else:
+                    # Tem histórico real parcial → ajuste leve proporcional à incerteza
+                    peso_xgb = 1.0 - _confianca.get(item_a, 1.0)
+                    if mae_relativo > 0.12 and peso_xgb > 0:
+                        mult_atual = mapa_mult[item_a]
+                        mapa_mult[item_a] = round(min(mult_atual + 0.3 * peso_xgb, 3.0), 2)
+
+            print(f"📐 Calibração por XGB_Audit (V2): {n_proxy} itens via proxy MAE.")
     except gspread.exceptions.WorksheetNotFound:
         print("ℹ️  XGB_Audit (V2) ainda não existe — será criada neste ciclo.")
     except Exception as e:
@@ -1675,7 +1767,9 @@ for item in df_ranking['Item']:
 
         if pode_gerar:
             if not any(x[10] == chave_unica for x in novas_linhas_validacao):
-                linha_sinais_hoje = len(lista_final)
+                # +1 porque o item já foi adicionado a lista_final e o
+                # cabeçalho de Sinais_Hoje ocupa a linha 1 da planilha.
+                linha_sinais_hoje = len(lista_final) + 1
                 enviar_telegram(acao, item, preco_atual, linha_sinais_hoje)
 
                 if tipo_sinal == "COMPRA":
