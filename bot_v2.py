@@ -61,7 +61,7 @@ PLANILHA_ORIGEM = "SFL 2025_10"       # RecLog/TradeLog/Inventario — APENAS LE
 PLANILHA_V2     = "SFL 2025_10_V2"    # abas geridas pela V2 — leitura E escrita
 
 REGISTROS_POR_DIA = 24
-TAXA_MARKETPLACE = 0.1
+TAXA_MARKETPLACE = 0.125
 LUCRO_REAL_DESEJADO = 0.07
 DIAS_SWING = 12
 SHIFT_ALVO = DIAS_SWING * REGISTROS_POR_DIA   # estrutural — idêntico ao V1, não mudar
