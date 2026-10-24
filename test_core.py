@@ -85,8 +85,9 @@ def main():
 
     # ---- 5. EV pode ser negativo e vetar (antes era inalcançável) -------------
     vals = []
-    for i in range(10):
-        vals.append([i + 1, "COMPRA", "01/09/2026 10:00", "Egg", 1.0, 1.2, 1.0, "❌ FALHOU", 30,
+    for i in range(10):    # 5 dias entre sinais => 10 episódios distintos
+        vals.append([i + 1, "COMPRA", (datetime(2026, 7, 1, 10, 0) + timedelta(days=5 * i)).strftime("%d/%m/%Y %H:%M"),
+                     "Egg", 1.0, 1.2, 1.0, "❌ FALHOU", 30,
                      "'1011100", f"k{i}", 30.0, 0.80, ""])    # preço final -20%: perda real
     dfv = pd.DataFrame(vals, columns=["ID_Sinal", "Tipo", "Data_Sinal", "Item", "Preco_Sinal", "Referencia_Fin",
                                        "Monitoramento_12d", "Status", "Dias_Passados", "Estado_RL", "Chave_Unica",
@@ -145,6 +146,36 @@ def main():
     assert abs(custo["Egg"] - (10 * 0.1 + 5 * 0.2) / 15) < 1e-9, custo        # 10 do lote novo + 5 do antigo
     assert datas["Egg"] == pd.Timestamp("2026-10-01 10:00")
     print("✓ FIFO por data:", custo, datas)
+    # ---- 11. episódios: 10 sinais de uma condição persistente = 1 episódio ------
+    seq = dfv.copy()
+    seq["Data_Sinal"] = [(datetime(2026, 8, 1, 10, 0) + timedelta(days=i)).strftime("%d/%m/%Y %H:%M") for i in range(10)]
+    seq["Status"], seq["Preco_Final"] = "🏆 ACERTOU", 0.90          # 24h entre sinais, mesmo item e tipo
+    conc_seq = preparar_concluidos(seq)
+    assert conc_seq["Episodio"].nunique() == 1, conc_seq["Episodio"].tolist()
+    mm, mr, mv = {}, {}, {}
+    usados = calibrar_por_taxa_confianca(conc_seq, mm, mr, mv)
+    assert usados["Egg"] == 1, usados
+    assert mv["Egg"] is False and mm["Egg"] == 2.2, "1 episódio não pode virar 'confiante' (N>=8)"
+    # os mesmos 10 sinais espaçados em 5 dias = 10 episódios => confiante, EV<0 => veto (teste 5)
+    seq5 = dfv.copy()
+    seq5["Status"], seq5["Preco_Final"] = "🏆 ACERTOU", 0.90
+    assert preparar_concluidos(seq5)["Episodio"].nunique() == 10
+
+    # limite do gap (48h) e separação por tipo/STOP/item
+    tri = dfv.iloc[:5].copy()
+    tri["Data_Sinal"] = ["01/08/2026 10:00", "02/08/2026 10:00",   # +24h: mesmo episódio
+                         "03/08/2026 11:00",                        # +25h: mesmo episódio
+                         "06/08/2026 12:00",                        # +73h (> 48h): novo episódio
+                         "01/08/2026 10:00"]                        # STOP no mesmo instante do 1º: episódio próprio
+    tri["Chave_Unica"] = ["a", "b", "c", "d", "e_STOP"]
+    tri["Status"] = "🏆 ACERTOU"
+    ep = atribuir_episodios(tri)["Episodio"].tolist()
+    assert ep[0] == ep[1] == ep[2] and ep[3] != ep[0] and ep[4] not in ep[:4], ep
+    outro_item = tri.iloc[:1].copy(); outro_item["Item"] = "Wheat"
+    assert atribuir_episodios(pd.concat([tri.iloc[:1], outro_item]))["Episodio"].nunique() == 2
+    # alocação: item com apenas 1 episódio (mesmo com 10 sinais) fica de fora
+    assert calcular_alocacao_recursos(conc_seq, min_sinais=3).empty
+    print("✓ episódios: 10 sinais persistentes = 1 episódio; gap 48h; STOP e item separados")
     print("\nTODOS OS TESTES PASSARAM")
 
 
