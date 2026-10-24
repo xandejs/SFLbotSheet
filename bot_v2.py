@@ -106,6 +106,29 @@ def trava(acao):
         return False
 
 
+def avisar_ciclo_ok(dur_s, novos, itens):
+    """
+    Heartbeat: avisa o Apps Script (doPost, acao='ciclo_ok') que o ciclo terminou. O
+    dispatcher alerta por e-mail se isso parar de chegar (workflow que o GitHub aceitou
+    disparar mas não rodou / falhou antes do Python: Actions desativado, minutos
+    esgotados, secret faltando, pip, timeout). Falha aqui NUNCA derruba o ciclo.
+    """
+    url, token = os.environ.get("TRAVA_URL"), os.environ.get("TRAVA_TOKEN")
+    if not url or not token:
+        print("⚠️ TRAVA_URL/TRAVA_TOKEN ausentes — heartbeat não enviado.")
+        return False
+    try:
+        r = requests.post(url, json={"token": token, "acao": "ciclo_ok",
+                                     "dados": {"dur": round(dur_s), "novos": int(novos), "itens": int(itens)}},
+                          timeout=30)
+        ok = bool(r.ok and r.json().get("ok"))
+        print(f"💓 heartbeat: {'ok' if ok else 'falhou — ' + r.text[:150]}")
+        return ok
+    except Exception as e:
+        print(f"⚠️ heartbeat falhou ({e}) — ciclo segue válido.")
+        return False
+
+
 # ==============================================================================
 # PLANILHAS
 # ==============================================================================
@@ -552,6 +575,7 @@ def main():
     except Exception as e:
         print(f"⚠️ Falha ao salvar cache: {e}")
 
+    avisar_ciclo_ok(time.time() - t0, len(novas_validacao), len(cache_ind))
     print(f"🏁 Ciclo V2 concluído em {time.time() - t0:.0f}s.")
 
 
