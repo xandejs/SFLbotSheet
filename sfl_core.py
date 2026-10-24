@@ -45,6 +45,7 @@ POSICAO_MINIMA_SFL = 5.0
 ALPHA_MINIMO = 0.05
 
 CALIBRAR_SO_COMPRA = True          # mapas de banda/veto governam compras: calibra só com sinais de COMPRA
+EPISODIO_GAP_H = 48                # sinais do mesmo item+tipo com <= 48h entre si = mesmo episódio (condição persistente)
 MAX_IDADE_PRECO_ITEM_H = 6.0       # item cujo último preço > 6h atrás não gera sinal (ex.: sem oferta/preço 0)
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
@@ -249,11 +250,54 @@ def recompensa_sinal(tipo, status, preco_sinal, preco_final):
     return -1.0
 
 
+def atribuir_episodios(df_val):
+    """
+    Adiciona a coluna 'Episodio' (int). O dedup libera um novo sinal a cada ~24h
+    enquanto a condição persiste; 8 sinais assim são UM episódio (as janelas de
+    12 dias se sobrepõem, então os resultados não são independentes). Regra:
+    mesmo Item + mesmo tipo (COMPRA / VENDA / STOP) com no máximo EPISODIO_GAP_H
+    horas entre sinais consecutivos. Data inválida vira episódio próprio.
+    Deve receber TODOS os sinais (inclusive os abertos), para o episódio não
+    "quebrar" por falta de vizinhos.
+    """
+    df = df_val.copy()
+    if df.empty:
+        df["Episodio"] = pd.Series(dtype=int)
+        return df
+    item = df["Item"].astype(str).str.strip()
+    chave = df["Chave_Unica"].astype(str) if "Chave_Unica" in df.columns else pd.Series("", index=df.index)
+    tipo = pd.Series(np.where(chave.str.contains("_STOP", regex=False), "STOP",
+                              df["Tipo"].astype(str).str.strip().str.upper()), index=df.index)
+    dt = pd.to_datetime(df["Data_Sinal"].apply(parse_data_sinal_robusta), errors="coerce")
+    tmp = pd.DataFrame({"g": item + "|" + tipo, "dt": dt}).sort_values(["g", "dt"], kind="stable")
+    novo = ((tmp["g"] != tmp["g"].shift()) | tmp["dt"].isna() | tmp["dt"].shift().isna()
+            | ((tmp["dt"] - tmp["dt"].shift()) > pd.Timedelta(hours=EPISODIO_GAP_H)))
+    tmp["ep"] = novo.cumsum()
+    df["Episodio"] = tmp["ep"].reindex(df.index).astype(int)
+    return df
+
+
+def _serie_episodio(df):
+    return df["Episodio"] if "Episodio" in df.columns else pd.Series(range(len(df)), index=df.index)
+
+
+def resumo_episodios(grupo):
+    """(n_episodios, n_acertos, soma_recompensas): cada episódio pesa 1 (média dos seus sinais)."""
+    ep = _serie_episodio(grupo)
+    pts = grupo["Pts"].groupby(ep).mean()
+    rec = grupo["Recompensa"].groupby(ep).mean()
+    return len(pts), int((pts >= 0.5).sum()), float(rec.sum())
+
+
 def preparar_concluidos(df_val):
-    """Sinais concluídos com Pts, Recompensa e ROI_Realizado. DataFrame vazio se não houver."""
+    """
+    Sinais concluídos com Pts, Recompensa, ROI_Realizado e Episodio.
+    DataFrame vazio se não houver. Os episódios são calculados sobre TODOS os sinais.
+    """
     if df_val is None or df_val.empty:
         return pd.DataFrame()
-    df = df_val[df_val["Status"].astype(str).str.contains("🏆|❌|💰", na=False)].copy()
+    df_all = atribuir_episodios(df_val)
+    df = df_all[df_all["Status"].astype(str).str.contains("🏆|❌|💰", na=False)].copy()
     if df.empty:
         return pd.DataFrame()
     df["Pts"] = df["Status"].apply(pontos_status)
@@ -297,7 +341,7 @@ def calcular_taxa_confianca(n_total, n_acertos, soma_recompensas,
 def calcular_prior_empirico(df_conc, forca_prior=4.0):
     if df_conc is None or df_conc.empty:
         return 1.0, 1.0
-    taxa_global = (df_conc["Pts"] >= 0.5).mean()
+    taxa_global = (df_conc["Pts"].groupby(_serie_episodio(df_conc)).mean() >= 0.5).mean()   # por episódio
     return max(forca_prior * taxa_global, 0.5), max(forca_prior * (1 - taxa_global), 0.5)
 
 
@@ -310,10 +354,9 @@ def calibrar_por_taxa_confianca(df_conc, mapa_mult, mapa_roi, mapa_veto, so_comp
     base = df_conc[df_conc["Tipo"] == "COMPRA"] if so_compra else df_conc
 
     for item_c, grupo in base.groupby("Item"):
-        n = len(grupo)
-        n_acertos = int((grupo["Pts"] >= 0.5).sum())
+        n, n_acertos, soma_rec = resumo_episodios(grupo)      # N = episódios, não sinais
         _, confiante, ev = calcular_taxa_confianca(
-            n, n_acertos, float(grupo["Recompensa"].sum()), prior_a=prior_a, prior_b=prior_b)
+            n, n_acertos, soma_rec, prior_a=prior_a, prior_b=prior_b)
         usados[item_c] = n
 
         if not confiante:
@@ -350,7 +393,8 @@ def calibrar_hibrido(df_val, df_audit, df_bruto):
         usados = calibrar_por_taxa_confianca(df_conc, mapa_mult, mapa_roi, mapa_veto)
         for it, n in usados.items():
             confianca[it] = min(1.0, n / 10.0)
-        print(f"📈 Calibração Bayesiana: {len(usados)} itens | {len(df_conc)} sinais concluídos.")
+        n_ep = int(df_conc["Episodio"].nunique()) if "Episodio" in df_conc.columns else len(df_conc)
+        print(f"📈 Calibração Bayesiana: {len(usados)} itens | {len(df_conc)} sinais concluídos em {n_ep} episódios.")
     else:
         print("ℹ️  Calibração: nenhum sinal concluído ainda — fase bootstrap.")
 
@@ -393,16 +437,16 @@ def calcular_alocacao_recursos(df_conc, dias_swing=12, min_sinais=3):
     prior_a, prior_b = calcular_prior_empirico(df_conc)
     linhas = []
     for item_a, grupo in df_conc.groupby("Item"):
-        n = len(grupo)
+        n, n_acertos, soma_rec = resumo_episodios(grupo)      # min_sinais agora conta EPISÓDIOS
         if n < min_sinais:
             continue
-        n_acertos = int((grupo["Pts"] >= 0.5).sum())
         taxa_ef, confiante, ev = calcular_taxa_confianca(
-            n, n_acertos, float(grupo["Recompensa"].sum()), prior_a=prior_a, prior_b=prior_b)
+            n, n_acertos, soma_rec, prior_a=prior_a, prior_b=prior_b)
 
-        dias_validos = grupo["Dias_Ate_Alvo_N"].dropna()
+        ep = _serie_episodio(grupo)
+        dias_validos = grupo["Dias_Ate_Alvo_N"].groupby(ep).mean().dropna()
         dias_medio = max(dias_validos.mean() if not dias_validos.empty else float(dias_swing), 1.0)
-        roi_medio_pct = grupo["ROI_Realizado"].mean()
+        roi_medio_pct = grupo["ROI_Realizado"].groupby(ep).mean().mean()
         try:
             ret_anual = ((1 + roi_medio_pct / 100) ** (365 / dias_medio) - 1) * 100
         except (OverflowError, ZeroDivisionError, ValueError):
