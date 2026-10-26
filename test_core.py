@@ -176,6 +176,27 @@ def main():
     # alocação: item com apenas 1 episódio (mesmo com 10 sinais) fica de fora
     assert calcular_alocacao_recursos(conc_seq, min_sinais=3).empty
     print("✓ episódios: 10 sinais persistentes = 1 episódio; gap 48h; STOP e item separados")
+
+    # ---- 12. item congelado (evento): banda degenerada não pode gerar COMPRA -----
+    d = cache_ind["Egg"].copy()
+    d["Price"], d["Media_Macro"], d["Desvio_Macro"] = 0.05, 0.05, 0.0
+    res = decidir_item("Egg", d.iloc[-1], -7.5, 0, 0, 0.05, None, 2.0, False, {}, {}, d_item_hist=d)
+    assert res and not res["gera_sinal"] and "COMPRAR" not in res["acao"], res["acao"]
+    assert "CONGELADO" in res["acao"], res["acao"]
+    print("✓ item congelado não gera COMPRA ->", res["acao"])
+    # banda estreita mas preço vivo (não congelado): compra sem margem após a taxa também é barrada
+    d2 = cache_ind["Egg"].copy()
+    m = float(d2["Media_Macro"].iloc[-1])
+    d2.loc[d2.index[-1], ["Desvio_Macro", "Price"]] = [m * 0.01, m * 0.97]     # alvo_in = 0.98m, alvo_out = 1.02m
+    res2 = decidir_item("Egg", d2.iloc[-1], 0.0, 0, 0, m, None, 2.0, False, {}, {}, d_item_hist=d2)
+    assert res2 and "BANDA" in res2["acao"] and not res2["gera_sinal"], res2 and res2["acao"]
+    print("✓ banda < taxa não gera COMPRA ->", res2["acao"])
+    # sanidade: banda larga e preço vivo continua gerando COMPRA
+    d3 = cache_ind["Egg"].copy()
+    d3.loc[d3.index[-1], ["Desvio_Macro", "Price"]] = [m * 0.3, m * 0.35]      # alvo_in = 0.4m, alvo_out = 1.6m
+    res3 = decidir_item("Egg", d3.iloc[-1], 5.0, 0, 0, m, None, 2.0, False, {}, {}, d_item_hist=d3)
+    assert res3 and "COMPRAR" in res3["acao"] and res3["gera_sinal"], res3 and res3["acao"]
+    print("✓ banda larga continua gerando COMPRA ->", res3["acao"])
     print("\nTODOS OS TESTES PASSARAM")
 
 
