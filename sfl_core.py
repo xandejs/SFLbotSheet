@@ -47,6 +47,8 @@ ALPHA_MINIMO = 0.05
 CALIBRAR_SO_COMPRA = True          # mapas de banda/veto governam compras: calibra só com sinais de COMPRA
 EPISODIO_GAP_H = 48                # sinais do mesmo item+tipo com <= 48h entre si = mesmo episódio (condição persistente)
 MAX_IDADE_PRECO_ITEM_H = 6.0       # item cujo último preço > 6h atrás não gera sinal (ex.: sem oferta/preço 0)
+LUCRO_MIN_BANDA = 0.0              # COMPRAR exige que vender em alvo_out (já sem taxa) ao menos empate; suba até LUCRO_REAL_DESEJADO p/ ser mais estrito
+HORAS_PRECO_CONGELADO = 72         # sem nenhuma variação nesse período = item sem mercado (ex.: item de evento)
 
 MAP_ESTACOES = {"PRIMAVERA": 0, "VERÃO": 1, "OUTONO": 2, "INVERNO": 3}
 
@@ -667,6 +669,14 @@ def calcular_margem_atencao(alvo_in, alvo_out, fracao=0.15, minimo_abs=0.0001, m
     return round(margem, 6)
 
 
+def preco_congelado(d_item, horas=HORAS_PRECO_CONGELADO):
+    """True se o preço não variou nas últimas `horas` (ex.: item de evento sem oferta)."""
+    if d_item is None or len(d_item) < horas:
+        return False
+    p = d_item["Price"].iloc[-horas:]
+    return (p.max() - p.min()) <= 1e-9 * max(p.max(), 1e-12)
+
+
 def detectar_regime(d_item, janela_crash_h=24, limiar_queda=-0.12):
     if d_item is None or len(d_item) < janela_crash_h:
         return False, 0.0
@@ -771,6 +781,13 @@ def decidir_item(item, row, roi_pred, saldo_item, compras_log_item, custo_medio,
         elif acao == "ESPERAR":
             acao = "ESPERAR (Prejuízo)"
     acao_pos_stop = acao
+
+    if acao == "🟢 COMPRAR":
+        retorno_banda = alvo_out * (1 - TAXA_MARKETPLACE) / preco_atual - 1
+        if preco_congelado(d_item_hist):
+            acao = "🚫 PREÇO CONGELADO (sem mercado)"
+        elif retorno_banda < LUCRO_MIN_BANDA:
+            acao = "🚫 BANDA < TAXA (compra sem margem)"
 
     if acao == "🟢 COMPRAR" and veto_manual:
         acao = "🚫 COMPRA VETADA"
